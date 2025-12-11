@@ -1,0 +1,27 @@
+[package]
+name = "verifactu"
+version = "0.1.0"
+edition = "2024"
+authors = ["Rafael Fernández López <ereslibre@curried.software>"]
+license = "MIT"
+description = "A library to communicate with the Verifactu API"
+repository = "https://github.com/curriedsoftware/verifactu"
+
+[features]
+production = []
+
+[dependencies]
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+quick-xml = { version = "0.38", features = ["serialize"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+urlencoding = "2.1"
+url = "2.5"
+qrcode = "0.14"
+image = "0.25"
+pem = "3.0"
+pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
