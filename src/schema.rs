@@ -1892,27 +1892,29 @@ impl RegistroFacturacionAlta {
 
         // Validate facturas_rectificadas length
         if let Some(ref facturas) = self.facturas_rectificadas
-            && facturas.len() > 1000 {
-                return Err(ValidationError::new(
-                    "RegistroFacturacionAlta",
-                    format!(
-                        "cannot exceed 1000 facturas_rectificadas, got {}",
-                        facturas.len()
-                    ),
-                ));
-            }
+            && facturas.len() > 1000
+        {
+            return Err(ValidationError::new(
+                "RegistroFacturacionAlta",
+                format!(
+                    "cannot exceed 1000 facturas_rectificadas, got {}",
+                    facturas.len()
+                ),
+            ));
+        }
 
         // Validate facturas_sustituidas length
         if let Some(ref facturas) = self.facturas_sustituidas
-            && facturas.len() > 1000 {
-                return Err(ValidationError::new(
-                    "RegistroFacturacionAlta",
-                    format!(
-                        "cannot exceed 1000 facturas_sustituidas, got {}",
-                        facturas.len()
-                    ),
-                ));
-            }
+            && facturas.len() > 1000
+        {
+            return Err(ValidationError::new(
+                "RegistroFacturacionAlta",
+                format!(
+                    "cannot exceed 1000 facturas_sustituidas, got {}",
+                    facturas.len()
+                ),
+            ));
+        }
 
         // Validate desglose has at least 1 and at most 12 entries
         if self.desglose.detalle_desglose.is_empty() {
@@ -2299,6 +2301,20 @@ pub struct SoapEnvelopeRespuestaReg<T> {
 #[derive(Deserialize)]
 pub struct SoapBodyRespuestaReg<T> {
     #[serde(rename = "RespuestaRegFactuSistemaFacturacion")]
+    pub payload: T,
+}
+
+#[derive(Deserialize)]
+pub struct SoapEnvelopeRespuestaConsulta<T> {
+    #[serde(rename = "Header")]
+    pub _header: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "Body")]
+    pub body: SoapBodyRespuestaConsulta<T>,
+}
+
+#[derive(Deserialize)]
+pub struct SoapBodyRespuestaConsulta<T> {
+    #[serde(rename = "RespuestaConsultaLRFactuSistemaFacturacion")]
     pub payload: T,
 }
 

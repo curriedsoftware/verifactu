@@ -28,12 +28,21 @@ pub mod hashing;
 mod qr;
 pub mod schema;
 
+use schema::IntoSoapXml;
+
 #[macro_export]
 macro_rules! request {
-    ($client: ident, $record: ident, $endpoint: path, $response_type: ty) => {{
-        let xml_body = $record.to_xml();
-        eprintln!("sending XML to {}", $endpoint);
-        println!("{}", xml_body);
+    ($client: ident, $record: ident, $endpoint: path, $envelope_type: ty) => {{
+        let xml_payload = $record.to_xml();
+        let namespaces = $record.soap_envelope_namespaces();
+        let xml_body = format!(
+            "<?xml version=\"1.0\"?>\n\
+             <soapenv:Envelope {namespaces}><soapenv:Header/><soapenv:Body>\
+             {payload}\
+             </soapenv:Body></soapenv:Envelope>",
+            namespaces = namespaces,
+            payload = xml_payload
+        );
 
         let response_text = $client
             .post($endpoint)
@@ -46,82 +55,129 @@ macro_rules! request {
             .await
             .map_err(|err| errors::Error::RequestError(format!("{:?}", err)))?;
 
-        println!("response as text was {}", response_text);
-
-        let envelope: schema::SoapEnvelopeRespuestaReg<$response_type> =
-            quick_xml::de::from_str(&response_text)
-                .map_err(|err| errors::Error::RequestError(format!("{:?}", err)))?;
+        let envelope: $envelope_type = quick_xml::de::from_str(&response_text)
+            .map_err(|err| errors::Error::RequestError(format!("{:?}", err)))?;
 
         Ok(envelope.body.payload)
     }};
 }
 
-// pub async fn alta(
-//     client: &Client,
-//     record: &schema::SuministroInformacion,
-// ) -> Result<RespuestaSuministro, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_VERIFACTU)
-// }
+pub async fn alta(
+    client: &reqwest::Client,
+    record: &schema::SuministroInformacion,
+) -> Result<schema::RespuestaSuministro, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_VERIFACTU,
+        schema::SoapEnvelopeRespuestaReg<schema::RespuestaSuministro>
+    )
+}
 
-// pub async fn alta_subsanacion(
-//     client: &Client,
-//     record: &schema::SuministroInformacion,
-// ) -> Result<RespuestaSuministro, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_VERIFACTU)
-// }
+pub async fn alta_subsanacion(
+    client: &reqwest::Client,
+    record: &schema::SuministroInformacion,
+) -> Result<schema::RespuestaSuministro, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_VERIFACTU,
+        schema::SoapEnvelopeRespuestaReg<schema::RespuestaSuministro>
+    )
+}
 
-// pub async fn alta_por_rechazo(
-//     client: &Client,
-//     record: &schema::SuministroInformacion,
-// ) -> Result<RespuestaSuministro, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_VERIFACTU)
-// }
+pub async fn alta_por_rechazo(
+    client: &reqwest::Client,
+    record: &schema::SuministroInformacion,
+) -> Result<schema::RespuestaSuministro, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_VERIFACTU,
+        schema::SoapEnvelopeRespuestaReg<schema::RespuestaSuministro>
+    )
+}
 
-// pub async fn anulacion(
-//     client: &Client,
-//     record: &schema::SuministroInformacion,
-// ) -> Result<RespuestaSuministro, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_VERIFACTU)
-// }
+pub async fn anulacion(
+    client: &reqwest::Client,
+    record: &schema::SuministroInformacion,
+) -> Result<schema::RespuestaSuministro, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_VERIFACTU,
+        schema::SoapEnvelopeRespuestaReg<schema::RespuestaSuministro>
+    )
+}
 
-// pub async fn anulacion_tras_rechazo(
-//     client: &Client,
-//     record: &schema::SuministroInformacion,
-// ) -> Result<RespuestaSuministro, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_VERIFACTU)
-// }
+pub async fn anulacion_tras_rechazo(
+    client: &reqwest::Client,
+    record: &schema::SuministroInformacion,
+) -> Result<schema::RespuestaSuministro, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_VERIFACTU,
+        schema::SoapEnvelopeRespuestaReg<schema::RespuestaSuministro>
+    )
+}
 
-// pub async fn anulacion_registro_desconocido(
-//     client: &Client,
-//     record: &schema::SuministroInformacion,
-// ) -> Result<RespuestaSuministro, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_VERIFACTU)
-// }
+pub async fn anulacion_registro_desconocido(
+    client: &reqwest::Client,
+    record: &schema::SuministroInformacion,
+) -> Result<schema::RespuestaSuministro, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_VERIFACTU,
+        schema::SoapEnvelopeRespuestaReg<schema::RespuestaSuministro>
+    )
+}
 
-// pub async fn requerimiento_alta(
-//     client: &Client,
-//     record: &schema::SuministroInformacion,
-// ) -> Result<RespuestaSuministro, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_REQUERIMIENTO)
-// }
+pub async fn requerimiento_alta(
+    client: &reqwest::Client,
+    record: &schema::SuministroInformacion,
+) -> Result<schema::RespuestaSuministro, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_REQUERIMIENTO,
+        schema::SoapEnvelopeRespuestaReg<schema::RespuestaSuministro>
+    )
+}
 
-// pub async fn requerimiento_alta_subsanacion(
-//     client: &Client,
-//     record: &schema::SuministroInformacion,
-// ) -> Result<RespuestaSuministro, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_REQUERIMIENTO)
-// }
+pub async fn requerimiento_alta_subsanacion(
+    client: &reqwest::Client,
+    record: &schema::SuministroInformacion,
+) -> Result<schema::RespuestaSuministro, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_REQUERIMIENTO,
+        schema::SoapEnvelopeRespuestaReg<schema::RespuestaSuministro>
+    )
+}
 
-// pub async fn requerimiento_anulacion(
-//     client: &Client,
-//     record: &schema::SuministroInformacion,
-// ) -> Result<RespuestaSuministro, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_REQUERIMIENTO)
-// }
+pub async fn requerimiento_anulacion(
+    client: &reqwest::Client,
+    record: &schema::SuministroInformacion,
+) -> Result<schema::RespuestaSuministro, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_REQUERIMIENTO,
+        schema::SoapEnvelopeRespuestaReg<schema::RespuestaSuministro>
+    )
+}
 
-// pub async fn consulta(
-//     client: &Client,
-//     record: &schema::ConsultaFactuSistemaFacturacion,
-// ) -> Result<RespuestaConsultaLR, errors::Error> {
-//     request!(client, record, endpoints::SISTEMA_VERIFACTU)
-// }
+pub async fn consulta(
+    client: &reqwest::Client,
+    record: &schema::ConsultaFactuSistemaFacturacion,
+) -> Result<schema::RespuestaConsultaLR, errors::Error> {
+    request!(
+        client,
+        record,
+        endpoints::SISTEMA_VERIFACTU,
+        schema::SoapEnvelopeRespuestaConsulta<schema::RespuestaConsultaLR>
+    )
+}
