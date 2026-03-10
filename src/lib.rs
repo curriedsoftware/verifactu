@@ -28,21 +28,30 @@ pub mod hashing;
 mod qr;
 pub mod schema;
 
-use schema::IntoSoapXml;
-
+#[doc(hidden)]
 #[macro_export]
-macro_rules! request {
-    ($client: ident, $record: ident, $endpoint: path, $envelope_type: ty) => {{
+macro_rules! __build_soap_xml {
+    ($record: ident) => {{
+        use $crate::schema::IntoSoapXml as _;
         let xml_payload = $record.to_xml();
         let namespaces = $record.soap_envelope_namespaces();
-        let xml_body = format!(
+        format!(
             "<?xml version=\"1.0\"?>\n\
              <soapenv:Envelope {namespaces}><soapenv:Header/><soapenv:Body>\
              {payload}\
              </soapenv:Body></soapenv:Envelope>",
             namespaces = namespaces,
             payload = xml_payload
-        );
+        )
+    }};
+}
+
+#[macro_export]
+macro_rules! request {
+    ($client: ident, $record: ident, $endpoint: path, $envelope_type: ty) => {{
+        let xml_body = $crate::__build_soap_xml!($record);
+
+        tracing::debug!(endpoint = $endpoint, body = %xml_body, "sending SOAP request");
 
         let response_text = $client
             .post($endpoint)
@@ -55,6 +64,8 @@ macro_rules! request {
             .await
             .map_err(|err| errors::Error::RequestError(format!("{:?}", err)))?;
 
+        tracing::debug!(response = %response_text, "received SOAP response");
+
         let envelope: $envelope_type = quick_xml::de::from_str(&response_text)
             .map_err(|err| errors::Error::RequestError(format!("{:?}", err)))?;
 
@@ -64,20 +75,19 @@ macro_rules! request {
 
 #[macro_export]
 macro_rules! log_request {
-    ($record: ident, $endpoint: path) => {{
-        let xml_payload = $record.to_xml();
-        let namespaces = $record.soap_envelope_namespaces();
-        let xml_body = format!(
-            "<?xml version=\"1.0\"?>\n\
-             <soapenv:Envelope {namespaces}><soapenv:Header/><soapenv:Body>\
-             {payload}\
-             </soapenv:Body></soapenv:Envelope>",
-            namespaces = namespaces,
-            payload = xml_payload
-        );
+    ($record: ident, $endpoint: path) => {
+        $crate::log_request!($record, $endpoint, tracing::Level::DEBUG)
+    };
+    ($record: ident, $endpoint: path, $level: expr) => {{
+        let xml_body = $crate::__build_soap_xml!($record);
 
-        println!("Would have sent the following request to {}", $endpoint);
-        println!("{}", xml_body);
+        match $level {
+            tracing::Level::TRACE => tracing::trace!(endpoint = $endpoint, body = %xml_body, "would send SOAP request"),
+            tracing::Level::DEBUG => tracing::debug!(endpoint = $endpoint, body = %xml_body, "would send SOAP request"),
+            tracing::Level::INFO => tracing::info!(endpoint = $endpoint, body = %xml_body, "would send SOAP request"),
+            tracing::Level::WARN => tracing::warn!(endpoint = $endpoint, body = %xml_body, "would send SOAP request"),
+            tracing::Level::ERROR => tracing::error!(endpoint = $endpoint, body = %xml_body, "would send SOAP request"),
+        }
     }};
 }
 
