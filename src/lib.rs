@@ -62,6 +62,25 @@ macro_rules! request {
     }};
 }
 
+#[macro_export]
+macro_rules! log_request {
+    ($record: ident, $endpoint: path) => {{
+        let xml_payload = $record.to_xml();
+        let namespaces = $record.soap_envelope_namespaces();
+        let xml_body = format!(
+            "<?xml version=\"1.0\"?>\n\
+             <soapenv:Envelope {namespaces}><soapenv:Header/><soapenv:Body>\
+             {payload}\
+             </soapenv:Body></soapenv:Envelope>",
+            namespaces = namespaces,
+            payload = xml_payload
+        );
+
+        println!("Would have sent the following request to {}", $endpoint);
+        println!("{}", xml_body);
+    }};
+}
+
 pub async fn alta(
     client: &reqwest::Client,
     record: &schema::SuministroInformacion,
