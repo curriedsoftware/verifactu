@@ -643,6 +643,11 @@ pub enum MostrarNombreRazonEmisor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IndicadorRepresentante {
+    S,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GeneradoPor {
     E,
     D,
@@ -926,12 +931,8 @@ impl IntoSoapXml for ConsultaFactuSistemaFacturacion {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CabeceraConsulta {
-    #[serde(
-        rename = "sum:IDVersion",
-        alias = "IDVersion",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub id_version: Option<StringMax16>,
+    #[serde(rename = "sum:IDVersion", alias = "IDVersion")]
+    pub id_version: StringMax16,
     #[serde(
         rename = "sum:ObligadoEmision",
         alias = "ObligadoEmision",
@@ -945,23 +946,11 @@ pub struct CabeceraConsulta {
     )]
     pub destinatario: Option<PersonaFisicaJuridicaConsulta>,
     #[serde(
-        rename = "sum:Representante",
-        alias = "Representante",
+        rename = "sum:IndicadorRepresentante",
+        alias = "IndicadorRepresentante",
         skip_serializing_if = "Option::is_none"
     )]
-    pub representante: Option<PersonaFisicaJuridicaConsulta>,
-    #[serde(
-        rename = "sum:MostrarSistemaInformatico",
-        alias = "MostrarSistemaInformatico",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub mostrar_sistema_informatico: Option<MostrarSistemaInformatico>,
-    #[serde(
-        rename = "sum:MostrarNombreRazonEmisor",
-        alias = "MostrarNombreRazonEmisor",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub mostrar_nombre_razon_emisor: Option<MostrarNombreRazonEmisor>,
+    pub indicador_representante: Option<IndicadorRepresentante>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2314,7 +2303,10 @@ pub struct SoapEnvelopeRespuestaConsulta<T> {
 
 #[derive(Deserialize)]
 pub struct SoapBodyRespuestaConsulta<T> {
-    #[serde(rename = "RespuestaConsultaLRFactuSistemaFacturacion")]
+    #[serde(
+        rename = "RespuestaConsultaLRFactuSistemaFacturacion",
+        alias = "RespuestaConsultaFactuSistemaFacturacion"
+    )]
     pub payload: T,
 }
 
