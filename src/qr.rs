@@ -55,7 +55,7 @@ impl RegistroFacturacionAlta {
         let mut uri = Url::parse(QR_URL).expect("valid URL");
         uri.set_query(Some(&format!(
             "nif={}&numserie={}&fecha={}&importe={}",
-            encode(&self.id_factura.id_emisor_factura.0),
+            encode(self.id_factura.id_emisor_factura.as_str()),
             encode(&self.id_factura.num_serie_factura),
             encode(&self.id_factura.fecha_expedicion_factura),
             encode(&self.importe_total),
@@ -73,7 +73,7 @@ impl RegistroFacturacionAnulacion {
         let mut uri = Url::parse(QR_URL).expect("valid URL");
         uri.set_query(Some(&format!(
             "nif={}&numserie={}&fecha={}&importe={}",
-            encode(&self.id_factura.id_emisor_factura_anulada.0),
+            encode(self.id_factura.id_emisor_factura_anulada.as_str()),
             encode(&self.id_factura.num_serie_factura_anulada),
             encode(&self.id_factura.fecha_expedicion_factura_anulada),
             encode(importe_total),

@@ -60,8 +60,49 @@ fn parses_voluntary_alta_normal_example() {
     let suministro = parse_suministro(VOLUNTARIA_ALTA_NORMAL);
     let alta = expect_single_alta(&suministro);
     assert!(matches!(alta.tipo_factura, TipoFactura::F1));
-    assert_eq!(alta.desglose.detalle_desglose.len(), 2);
+    assert_eq!(alta.desglose.detalle_desglose().len(), 2);
     assert!(alta.destinatarios.as_ref().is_some());
+}
+
+fn parse_suministro_result(xml: &str) -> Result<SuministroInformacion, quick_xml::DeError> {
+    from_str::<SoapEnvelopeReg<SuministroInformacion>>(xml).map(|envelope| envelope.body.payload)
+}
+
+// A party (`ObligadoEmision`) carrying neither a NIF nor an IDOtro is rejected
+// by the AEAT schema; the `Identificador` sum type makes that state fail to
+// deserialize rather than producing a half-built value.
+#[test]
+fn rejects_persona_with_no_identificador() {
+    let corrupted = VOLUNTARIA_ALTA_NORMAL.replace(
+        "<sum1:NombreRazon>XXXXX</sum1:NombreRazon><sum1:NIF>AAAA</sum1:NIF>",
+        "<sum1:NombreRazon>XXXXX</sum1:NombreRazon>",
+    );
+    assert_ne!(corrupted, VOLUNTARIA_ALTA_NORMAL, "fixture anchor drifted");
+    assert!(parse_suministro_result(&corrupted).is_err());
+}
+
+// A party carrying both a NIF and an IDOtro is likewise rejected.
+#[test]
+fn rejects_persona_with_both_identificadores() {
+    let corrupted = VOLUNTARIA_ALTA_NORMAL.replace(
+        "<sum1:NIF>AAAA</sum1:NIF></sum1:ObligadoEmision>",
+        "<sum1:NIF>AAAA</sum1:NIF><sum1:IDOtro><sum1:CodigoPais>ES</sum1:CodigoPais>\
+         <sum1:IDType>02</sum1:IDType><sum1:ID>X</sum1:ID></sum1:IDOtro></sum1:ObligadoEmision>",
+    );
+    assert_ne!(corrupted, VOLUNTARIA_ALTA_NORMAL, "fixture anchor drifted");
+    assert!(parse_suministro_result(&corrupted).is_err());
+}
+
+// An `Encadenamiento` declaring both a first-record marker and a previous
+// record is contradictory; the sum type rejects it on deserialization.
+#[test]
+fn rejects_encadenamiento_with_both_variants() {
+    let corrupted = VOLUNTARIA_ALTA_NORMAL.replace(
+        "<sum1:Encadenamiento><sum1:RegistroAnterior>",
+        "<sum1:Encadenamiento><sum1:PrimerRegistro>S</sum1:PrimerRegistro><sum1:RegistroAnterior>",
+    );
+    assert_ne!(corrupted, VOLUNTARIA_ALTA_NORMAL, "fixture anchor drifted");
+    assert!(parse_suministro_result(&corrupted).is_err());
 }
 
 #[test]

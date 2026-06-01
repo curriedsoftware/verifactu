@@ -27,7 +27,7 @@
 #![allow(clippy::large_enum_variant)]
 
 use quick_xml::se::to_string;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use std::{borrow::Cow, fmt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,9 +486,13 @@ impl_string_type!(IdOperacionesTrascendenciaTributaria);
 // placeholders such as "AAAA", so we keep the payload flexible and let
 // downstream validation enforce the length when required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NIF(pub String);
+pub struct NIF(String);
 
 impl NIF {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     fn validate(value: &str) -> Result<(), ValidationError> {
         // In production mode, enforce strict 9-character NIF validation
         #[cfg(feature = "production")]
@@ -562,48 +566,145 @@ pub enum Periodo {
     Diciembre,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Identifies a party by exactly one of a Spanish NIF or a foreign identifier
+/// (`IDOtro`). Modeled as a sum type so that the "neither" and "both" states —
+/// which the AEAT schema rejects — are unrepresentable.
+#[derive(Debug, Clone)]
+pub enum Identificador {
+    Nif(NIF),
+    IdOtro(IDOtro),
+}
+
+/// Builds an `Identificador` from the two optional wire fields, enforcing that
+/// exactly one is present.
+fn identificador_from_wire<E: serde::de::Error>(
+    type_name: &str,
+    nif: Option<NIF>,
+    id_otro: Option<IDOtro>,
+) -> Result<Identificador, E> {
+    match (nif, id_otro) {
+        (Some(nif), None) => Ok(Identificador::Nif(nif)),
+        (None, Some(id_otro)) => Ok(Identificador::IdOtro(id_otro)),
+        (Some(_), Some(_)) => Err(E::custom(format!(
+            "{type_name} cannot have both NIF and IDOtro"
+        ))),
+        (None, None) => Err(E::custom(format!(
+            "{type_name} must have either NIF or IDOtro"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PersonaFisicaJuridicaES {
-    #[serde(rename = "sum1:NombreRazon", alias = "NombreRazon")]
     pub nombre_razon: StringMax120,
+    pub identificador: Identificador,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersonaFisicaJuridicaESWire {
+    #[serde(rename = "sum1:NombreRazon", alias = "NombreRazon")]
+    nombre_razon: StringMax120,
     #[serde(
         rename = "sum1:NIF",
         alias = "NIF",
         skip_serializing_if = "Option::is_none"
     )]
-    pub nif: Option<NIF>,
+    nif: Option<NIF>,
     #[serde(
         rename = "sum1:IDOtro",
         alias = "IDOtro",
         skip_serializing_if = "Option::is_none"
     )]
-    pub id_otro: Option<IDOtro>,
+    id_otro: Option<IDOtro>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Serialize for PersonaFisicaJuridicaES {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (nif, id_otro) = match &self.identificador {
+            Identificador::Nif(nif) => (Some(nif.clone()), None),
+            Identificador::IdOtro(id_otro) => (None, Some(id_otro.clone())),
+        };
+        PersonaFisicaJuridicaESWire {
+            nombre_razon: self.nombre_razon.clone(),
+            nif,
+            id_otro,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PersonaFisicaJuridicaES {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = PersonaFisicaJuridicaESWire::deserialize(deserializer)?;
+        Ok(Self {
+            nombre_razon: wire.nombre_razon,
+            identificador: identificador_from_wire(
+                "PersonaFisicaJuridicaES",
+                wire.nif,
+                wire.id_otro,
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PersonaFisicaJuridicaConsulta {
-    #[serde(rename = "sum:NombreRazon", alias = "NombreRazon")]
     pub nombre_razon: StringMax120,
+    pub identificador: Identificador,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersonaFisicaJuridicaConsultaWire {
+    #[serde(rename = "sum:NombreRazon", alias = "NombreRazon")]
+    nombre_razon: StringMax120,
     #[serde(
         rename = "sum:NIF",
         alias = "NIF",
         skip_serializing_if = "Option::is_none"
     )]
-    pub nif: Option<NIF>,
+    nif: Option<NIF>,
     #[serde(
         rename = "sum:IDOtro",
         alias = "IDOtro",
         skip_serializing_if = "Option::is_none"
     )]
-    pub id_otro: Option<IDOtro>,
+    id_otro: Option<IDOtro>,
+}
+
+impl Serialize for PersonaFisicaJuridicaConsulta {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (nif, id_otro) = match &self.identificador {
+            Identificador::Nif(nif) => (Some(nif.clone()), None),
+            Identificador::IdOtro(id_otro) => (None, Some(id_otro.clone())),
+        };
+        PersonaFisicaJuridicaConsultaWire {
+            nombre_razon: self.nombre_razon.clone(),
+            nif,
+            id_otro,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PersonaFisicaJuridicaConsulta {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = PersonaFisicaJuridicaConsultaWire::deserialize(deserializer)?;
+        Ok(Self {
+            nombre_razon: wire.nombre_razon,
+            identificador: identificador_from_wire(
+                "PersonaFisicaJuridicaConsulta",
+                wire.nif,
+                wire.id_otro,
+            )?,
+        })
+    }
 }
 
 impl From<PersonaFisicaJuridicaES> for PersonaFisicaJuridicaConsulta {
     fn from(value: PersonaFisicaJuridicaES) -> Self {
         Self {
             nombre_razon: value.nombre_razon,
-            nif: value.nif,
-            id_otro: value.id_otro,
+            identificador: value.identificador,
         }
     }
 }
@@ -612,8 +713,7 @@ impl From<PersonaFisicaJuridicaConsulta> for PersonaFisicaJuridicaES {
     fn from(value: PersonaFisicaJuridicaConsulta) -> Self {
         Self {
             nombre_razon: value.nombre_razon,
-            nif: value.nif,
-            id_otro: value.id_otro,
+            identificador: value.identificador,
         }
     }
 }
@@ -1549,21 +1649,62 @@ pub struct IDFacturaAnulada {
     pub fecha_expedicion_factura_anulada: Fecha,
 }
 
-// Chaining/blockchain structure for invoice integrity
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct Encadenamiento {
+// Chaining/blockchain structure for invoice integrity.
+//
+// A record is either the first in the chain (`PrimerRegistro`) or links to the
+// previous record (`RegistroAnterior`); exactly one applies. Modeled as a sum
+// type so the "neither" and "both" states the AEAT schema rejects cannot be
+// constructed.
+#[derive(Debug, Clone)]
+pub enum Encadenamiento {
+    PrimerRegistro(SiNo),
+    RegistroAnterior(RegistroAnterior),
+}
+
+#[derive(Serialize, Deserialize)]
+struct EncadenamientoWire {
     #[serde(
         rename = "sum1:PrimerRegistro",
         alias = "PrimerRegistro",
         skip_serializing_if = "Option::is_none"
     )]
-    pub primer_registro: Option<SiNo>,
+    primer_registro: Option<SiNo>,
     #[serde(
         rename = "sum1:RegistroAnterior",
         alias = "RegistroAnterior",
         skip_serializing_if = "Option::is_none"
     )]
-    pub registro_anterior: Option<RegistroAnterior>,
+    registro_anterior: Option<RegistroAnterior>,
+}
+
+impl Serialize for Encadenamiento {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (primer_registro, registro_anterior) = match self {
+            Encadenamiento::PrimerRegistro(value) => (Some(value.clone()), None),
+            Encadenamiento::RegistroAnterior(registro) => (None, Some(registro.clone())),
+        };
+        EncadenamientoWire {
+            primer_registro,
+            registro_anterior,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Encadenamiento {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = EncadenamientoWire::deserialize(deserializer)?;
+        match (wire.primer_registro, wire.registro_anterior) {
+            (Some(value), None) => Ok(Encadenamiento::PrimerRegistro(value)),
+            (None, Some(registro)) => Ok(Encadenamiento::RegistroAnterior(registro)),
+            (Some(_), Some(_)) => Err(D::Error::custom(
+                "Encadenamiento cannot have both PrimerRegistro and RegistroAnterior",
+            )),
+            (None, None) => Err(D::Error::custom(
+                "Encadenamiento must have either PrimerRegistro or RegistroAnterior",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1628,14 +1769,19 @@ pub struct SistemaInformaticoConsulta {
 }
 
 // Tax breakdown structure
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Desglose {
     /// Maximum 12 entries as per XSD specification (maxOccurs=12)
     #[serde(rename = "sum1:DetalleDesglose", alias = "DetalleDesglose")]
-    pub detalle_desglose: Vec<Detalle>,
+    detalle_desglose: Vec<Detalle>,
 }
 
 impl Desglose {
+    /// Returns the tax breakdown detail lines.
+    pub fn detalle_desglose(&self) -> &[Detalle] {
+        &self.detalle_desglose
+    }
+
     /// Creates a new Desglose with validation of XSD constraints
     pub fn new(detalle_desglose: Vec<Detalle>) -> Result<Self, ValidationError> {
         if detalle_desglose.is_empty() {
@@ -1687,22 +1833,53 @@ impl Destinatarios {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Destinatario {
-    #[serde(rename = "sum1:NombreRazon", alias = "NombreRazon")]
     pub nombre_razon: StringMax120,
+    pub identificador: Identificador,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DestinatarioWire {
+    #[serde(rename = "sum1:NombreRazon", alias = "NombreRazon")]
+    nombre_razon: StringMax120,
     #[serde(
         rename = "sum1:NIF",
         alias = "NIF",
         skip_serializing_if = "Option::is_none"
     )]
-    pub nif: Option<NIF>,
+    nif: Option<NIF>,
     #[serde(
         rename = "sum1:IDOtro",
         alias = "IDOtro",
         skip_serializing_if = "Option::is_none"
     )]
-    pub id_otro: Option<IDOtro>,
+    id_otro: Option<IDOtro>,
+}
+
+impl Serialize for Destinatario {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (nif, id_otro) = match &self.identificador {
+            Identificador::Nif(nif) => (Some(nif.clone()), None),
+            Identificador::IdOtro(id_otro) => (None, Some(id_otro.clone())),
+        };
+        DestinatarioWire {
+            nombre_razon: self.nombre_razon.clone(),
+            nif,
+            id_otro,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Destinatario {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = DestinatarioWire::deserialize(deserializer)?;
+        Ok(Self {
+            nombre_razon: wire.nombre_razon,
+            identificador: identificador_from_wire("Destinatario", wire.nif, wire.id_otro)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
