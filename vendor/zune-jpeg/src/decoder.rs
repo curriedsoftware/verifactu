@@ -26,7 +26,7 @@ use crate::headers::{
     parse_start_of_frame
 };
 use crate::huffman::HuffmanTable;
-use crate::idct::choose_idct_func;
+use crate::idct::{choose_idct_func, choose_idct_1x1_func, choose_idct_4x4_func};
 use crate::marker::Marker;
 use crate::misc::SOFMarkers;
 use crate::upsampler::{
@@ -79,7 +79,7 @@ pub(crate) struct ICCChunk {
 
 /// A JPEG Decoder Instance.
 #[allow(clippy::upper_case_acronyms, clippy::struct_excessive_bools)]
-pub struct JpegDecoder<T: ZByteReaderTrait> {
+pub struct JpegDecoder<T> {
     /// Struct to hold image information from SOI
     pub(crate) info:              ImageInfo,
     ///  Quantization tables, will be set to none and the tables will
@@ -106,7 +106,6 @@ pub struct JpegDecoder<T: ZByteReaderTrait> {
     pub(crate) mcu_y:             usize,
     /// Is the image interleaved?
     pub(crate) is_interleaved:    bool,
-    pub(crate) sub_sample_ratio:  SampleRatios,
     /// Image input colorspace, should be YCbCr for a sane image, might be
     /// grayscale too
     pub(crate) input_colorspace:  ColorSpace,
@@ -124,6 +123,8 @@ pub struct JpegDecoder<T: ZByteReaderTrait> {
     pub(crate) succ_low:         u8,
     /// Number of components.
     pub(crate) num_scans:        u8,
+    /// For a scan, check if any component has vertical/horizontal sampling.
+    pub(crate) scan_subsampled:  bool,
     // Function pointers, for pointy stuff.
     /// Dequantize and idct function
     // This is determined at runtime which function to run, statically it's
@@ -131,6 +132,11 @@ pub struct JpegDecoder<T: ZByteReaderTrait> {
     // of this struct, we check if we can switch to a faster one which
     // depend on certain CPU extensions.
     pub(crate) idct_func: IDCTPtr,
+    /// Specialized IDCT when we can guarantee only few coefficients are non-zero.
+    ///
+    /// **The callee must uphold a contract**. See [`choose_idct_4x4_func`].
+    pub(crate) idct_4x4_func: IDCTPtr,
+    pub(crate) idct_1x1_func: IDCTPtr,
     // Color convert function which acts on 16 YCbCr values
     pub(crate) color_convert_16: ColorConvert16Ptr,
     pub(crate) z_order:          [usize; MAX_COMPONENTS],
@@ -148,7 +154,9 @@ pub struct JpegDecoder<T: ZByteReaderTrait> {
     // exif data, lifted from app2
     pub(crate) icc_data: Vec<ICCChunk>,
     pub(crate) is_mjpeg: bool,
-    pub(crate) coeff:    usize // Solves some weird bug :)
+    pub(crate) coeff:    usize, // Solves some weird bug :)
+    /// Extended XMP segments
+    pub(crate) extended_xmp_segments: Vec<ExtendedXmpSegment>,
 }
 
 impl<T> JpegDecoder<T>
@@ -172,14 +180,16 @@ where
             mcu_x:             0,
             mcu_y:             0,
             is_interleaved:    false,
-            sub_sample_ratio:  SampleRatios::None,
             is_progressive:    false,
             spec_start:        0,
             spec_end:          0,
             succ_high:         0,
             succ_low:          0,
             num_scans:         0,
+            scan_subsampled:   false, 
             idct_func:         choose_idct_func(&options),
+            idct_4x4_func:     choose_idct_4x4_func(&options),
+            idct_1x1_func:     choose_idct_1x1_func(&options),
             color_convert_16:  color_convert,
             input_colorspace:  ColorSpace::YCbCr,
             z_order:           [0; MAX_COMPONENTS],
@@ -191,7 +201,8 @@ where
             seen_sof:          false,
             icc_data:          vec![],
             is_mjpeg:          false,
-            coeff:             1
+            coeff:             1,
+            extended_xmp_segments: vec![],
         }
     }
     /// Decode a buffer already in memory
@@ -327,6 +338,52 @@ where
     pub fn set_options(&mut self, options: DecoderOptions) {
         self.options = options;
     }
+    fn reassemble_extended_xmp(&mut self) {
+        if self.extended_xmp_segments.is_empty() {
+            return;
+        }
+
+        // Sort by offset
+        self.extended_xmp_segments.sort_by(|a, b| a.offset.cmp(&b.offset));
+
+        let guid = &self.extended_xmp_segments[0].guid;
+        let total_size = self.extended_xmp_segments[0].total_size;
+
+        // Check for consistency
+        for segment in &self.extended_xmp_segments {
+            if &segment.guid != guid || segment.total_size != total_size {
+                error!("Inconsistent Extended XMP segments");
+                self.extended_xmp_segments.clear();
+                return;
+            }
+        }
+
+        let mut rolling_offset = 0;
+        let mut complete = true;
+
+        for segment in &self.extended_xmp_segments {
+            if segment.offset != rolling_offset {
+                // Gap or overlap
+                complete = false;
+                break;
+            }
+            rolling_offset += segment.data.len() as u32;
+        }
+
+        if complete && rolling_offset == total_size {
+            let mut result = Vec::with_capacity(total_size as usize);
+            for segment in &self.extended_xmp_segments {
+                result.extend_from_slice(&segment.data);
+            }
+            self.info.extended_xmp = Some(result);
+            self.info.extended_xmp_guid = Some(guid.clone());
+            self.extended_xmp_segments.clear();
+        } else if rolling_offset > total_size {
+            error!("Extended XMP overflow");
+            self.extended_xmp_segments.clear();
+        }
+        // Else: Incomplete, wait for more.
+    }
     /// Decode Decoder headers
     ///
     /// This routine takes care of parsing supported headers from a Decoder
@@ -424,6 +481,10 @@ where
                     bytes_before_marker = 0;
 
                     self.parse_marker_inner(n)?;
+
+                    if !self.extended_xmp_segments.is_empty() {
+                        self.reassemble_extended_xmp();
+                    }
 
                     // break after reading the start of scan.
                     // what follows is the image data
@@ -825,26 +886,6 @@ where
         if self.h_max == self.v_max && self.h_max == 1 {
             return Ok(());
         }
-        match (self.h_max, self.v_max) {
-            (1, 1) => {
-                self.sub_sample_ratio = SampleRatios::None;
-            }
-            (1, 2) => {
-                self.sub_sample_ratio = SampleRatios::V;
-            }
-            (2, 1) => {
-                self.sub_sample_ratio = SampleRatios::H;
-            }
-            (2, 2) => {
-                self.sub_sample_ratio = SampleRatios::HV;
-            }
-            (hs, vs) => {
-                self.sub_sample_ratio = SampleRatios::Generic(hs, vs)
-                // return Err(DecodeErrors::Format(format!(
-                //     "Unknown down-sampling method ({hs},{vs}), cannot continue")
-                // ))
-            }
-        }
 
         for comp in &mut self.components {
             let hs = self.h_max / comp.horizontal_sample;
@@ -857,15 +898,15 @@ where
                 }
                 (2, 1) => {
                     comp.sample_ratio = SampleRatios::H;
-                    choose_horizontal_samp_function(self.options.use_unsafe())
+                    choose_horizontal_samp_function(&self.options)
                 }
                 (1, 2) => {
                     comp.sample_ratio = SampleRatios::V;
-                    choose_v_samp_function(self.options.use_unsafe())
+                    choose_v_samp_function(&self.options)
                 }
                 (2, 2) => {
                     comp.sample_ratio = SampleRatios::HV;
-                    choose_hv_samp_function(self.options.use_unsafe())
+                    choose_hv_samp_function(&self.options)
                 }
                 (hs, vs) => {
                     comp.sample_ratio = SampleRatios::Generic(hs, vs);
@@ -914,6 +955,15 @@ where
 pub struct GainMapInfo {
     pub data: Vec<u8>
 }
+
+#[derive(Default, Clone, Eq, PartialEq, Debug)]
+pub(crate) struct ExtendedXmpSegment {
+    pub(crate) offset: u32,
+    pub(crate) total_size: u32,
+    pub(crate) guid: Vec<u8>,
+    pub(crate) data: Vec<u8>,
+}
+
 /// A struct representing Image Information
 #[derive(Default, Clone, Eq, PartialEq)]
 #[allow(clippy::module_name_repetitions)]
@@ -943,7 +993,15 @@ pub struct ImageInfo {
     /// XMP Data
     pub xmp_data: Option<Vec<u8>>,
     /// IPTC Data
-    pub iptc_data: Option<Vec<u8>>
+    pub iptc_data: Option<Vec<u8>>,
+    /// Extended XMP Data
+    pub extended_xmp: Option<Vec<u8>>,
+    /// Extended XMP Guid
+    pub extended_xmp_guid: Option<Vec<u8>>,
+    /// Image sub-sampling ratio
+    pub sample_ratio: SampleRatios,
+    /// The offset at which Multi picture information was found
+    pub multi_picture_information_offset: Option<u64>,
 }
 
 impl ImageInfo {

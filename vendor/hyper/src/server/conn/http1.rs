@@ -1,4 +1,4 @@
-//! HTTP/1 Server Connections
+//! HTTP/1 Server Connections.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -180,8 +180,15 @@ where
     pub fn without_shutdown(self) -> impl Future<Output = crate::Result<Parts<I, S>>> {
         let mut zelf = Some(self);
         crate::common::future::poll_fn(move |cx| {
-            ready!(zelf.as_mut().unwrap().conn.poll_without_shutdown(cx))?;
-            Poll::Ready(Ok(zelf.take().unwrap().into_parts()))
+            ready!(zelf
+                .as_mut()
+                .expect("server connection polled after completion")
+                .conn
+                .poll_without_shutdown(cx))?;
+            Poll::Ready(Ok(zelf
+                .take()
+                .expect("server connection missing before completion")
+                .into_parts()))
         })
     }
 
@@ -353,11 +360,11 @@ impl Builder {
     /// but may also improve performance when an IO transport doesn't
     /// support vectored writes well, such as most TLS implementations.
     ///
-    /// Setting this to true will force hyper to use queued strategy
-    /// which may eliminate unnecessary cloning on some TLS backends
+    /// Setting this to true will force hyper to use queued strategy,
+    /// which may eliminate unnecessary cloning on some TLS backends.
     ///
     /// Default is `auto`. In this mode hyper will try to guess which
-    /// mode to use
+    /// mode to use.
     pub fn writev(&mut self, val: bool) -> &mut Self {
         self.h1_writev = Some(val);
         self
@@ -522,6 +529,12 @@ where
             Pin::new(conn).graceful_shutdown()
         }
     }
+
+    /// Return the inner IO object, and additional information provided the connection
+    /// has not yet been upgraded.
+    pub fn into_parts(self) -> Option<Parts<I, S>> {
+        self.inner.map(|conn| conn.into_parts())
+    }
 }
 
 impl<I, B, S> Future for UpgradeableConnection<I, S>
@@ -539,7 +552,12 @@ where
             match ready!(Pin::new(&mut conn.conn).poll(cx)) {
                 Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
                 Ok(proto::Dispatched::Upgrade(pending)) => {
-                    let (io, buf, _) = self.inner.take().unwrap().conn.into_inner();
+                    let (io, buf, _) = self
+                        .inner
+                        .take()
+                        .expect("upgradeable server connection missing after upgrade")
+                        .conn
+                        .into_inner();
                     pending.fulfill(Upgraded::new(io, buf));
                     Poll::Ready(Ok(()))
                 }

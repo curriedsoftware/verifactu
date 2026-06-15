@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "53013612da51c61ec3f1a059fc3b89c080ca4b56"
+    "sha1": "8beb48b32e5b57dab67a4cb2bf2baca22792a605"
   },
-  "path_in_vcs": "zerocopy-derive"
+  "path_in_vcs": "zerocopy/zerocopy-derive"
 }

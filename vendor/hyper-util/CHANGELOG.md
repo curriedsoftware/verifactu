@@ -1,3 +1,17 @@
+# 0.1.20 (2026-02-02)
+
+- Fix `proxy::Matcher` to properly match domains regardless of casing
+- Fix system proxy matcher dependency on macOS when used in sandboxed environements.
+- Increased MSRV to 1.64.
+
+# 0.1.19 (2025-12-03)
+
+- Add `client::pool` module for composable pools. Enable with the `client-pool` feature.
+- Add `pool::singleton` for sharing a single cloneable connection.
+- Add `pool::cache` for caching a list of connections.
+- Add `pool::negotiate` for combining two pools with upgrade and fallback negotiation.
+- Add `pool::map` for customizable mapping of keys and connections.
+
 # 0.1.18 (2025-11-13)
 
 - Fix `rt::TokioTimer` to support Tokio's paused time.

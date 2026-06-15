@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.8.3 (2026-01-11)
+### Added
+- `Base64Pbkdf2` alphabet ([#2168])
+
+[#2168]: https://github.com/RustCrypto/formats/pull/2168
+
+## 1.8.2 (2026-01-03)
+### Changed
+- Deprecate `Base64Crypt` ([#2135])
+
+[#2135]: https://github.com/RustCrypto/formats/pull/2135
+
+## 1.8.1 (2025-12-06)
+### Added
+- Notes on `crypt(3)` alphabet variants ([#2073])
+
+### Fixed
+- Switch from `doc_auto_cfg` to `doc_cfg` ([#2072])
+
+[#2072]: https://github.com/RustCrypto/formats/pull/2072
+[#2073]: https://github.com/RustCrypto/formats/pull/2073
+
 ## 1.8.0 (2025-06-04)
 ### Changed
 - Bump edition to 2024; MSRV 1.85 ([#1839])

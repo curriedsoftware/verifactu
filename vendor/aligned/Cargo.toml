@@ -10,9 +10,15 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition = "2024"
 name = "aligned"
-version = "0.4.2"
+version = "0.4.3"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
 description = "A newtype with alignment of at least `A` bytes"
 documentation = "https://docs.rs/aligned"
 readme = "README.md"
@@ -30,5 +36,9 @@ categories = [
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rust-embedded-community/aligned"
 
+[lib]
+name = "aligned"
+path = "src/lib.rs"
+
 [dependencies.as-slice]
-version = "0.2.0"
+version = "0.2.1"

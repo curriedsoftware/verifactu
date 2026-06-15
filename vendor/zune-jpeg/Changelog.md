@@ -1,3 +1,13 @@
+## Version 0.5.7
+- Move scalar idct to wrapping maths.
+- Simd upsampling (mhils)
+- Faster zero idct check (mhils)
+## Version 0.5.6
+ - Better support for truncated images (by https://github.com/mhils)
+ - fix 4:1:0 chroma subsampling (by https://github.com/mhils)
+ - Fix some crashes
+ - Fix some bug on last pixel sampling
+
 ## Version 0.5.5
 - Support direct conversion of Luma to RGBA
 ## Version 0.5.4

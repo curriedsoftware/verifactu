@@ -16,10 +16,12 @@ use alloc::vec::Vec;
 
 use zune_core::bytestream::ZByteReaderTrait;
 use zune_core::colorspace::ColorSpace;
-use zune_core::log::{debug, error, trace, warn};
+use zune_core::log::{debug, trace, warn};
 
-use crate::components::Components;
-use crate::decoder::{GainMapInfo, ICCChunk, JpegDecoder, MAX_COMPONENTS};
+use core::cmp::max;
+
+use crate::components::{Components, SampleRatios};
+use crate::decoder::{ExtendedXmpSegment, GainMapInfo, ICCChunk, JpegDecoder, MAX_COMPONENTS};
 use crate::errors::DecodeErrors;
 use crate::huffman::HuffmanTable;
 use crate::misc::{SOFMarkers, UN_ZIGZAG};
@@ -277,6 +279,22 @@ pub(crate) fn parse_start_of_frame<T: ZByteReaderTrait>(
 
     img.components = components;
 
+    let mut h_max = 1;
+    let mut v_max = 1;
+
+    for comp in &img.components {
+        h_max = max(h_max, comp.horizontal_sample);
+        v_max = max(v_max, comp.vertical_sample);
+    }
+
+    img.info.sample_ratio = match (h_max, v_max) {
+        (1, 1) => SampleRatios::None,
+        (1, 2) => SampleRatios::V,
+        (2, 1) => SampleRatios::H,
+        (2, 2) => SampleRatios::HV,
+        (hs, vs) => SampleRatios::Generic(hs, vs)
+    };
+
     Ok(())
 }
 
@@ -314,6 +332,8 @@ pub(crate) fn parse_sos<T: ZByteReaderTrait>(
     }
 
     // consume spec parameters
+    image.scan_subsampled = false;
+
     for i in 0..ns {
         let id = image.stream.read_u8_err()?;
 
@@ -347,9 +367,21 @@ pub(crate) fn parse_sos<T: ZByteReaderTrait>(
             )));
         }
 
-        image.components[usize::from(j)].dc_huff_table = usize::from((y >> 4) & 0xF);
-        image.components[usize::from(j)].ac_huff_table = usize::from(y & 0xF);
+        let component = &mut image.components[usize::from(j)];
+        component.dc_huff_table = usize::from((y >> 4) & 0xF);
+        component.ac_huff_table = usize::from(y & 0xF);
         image.z_order[i as usize] = j as usize;
+
+        if component.vertical_sample != 1 || component.horizontal_sample != 1 {
+            image.scan_subsampled = true;
+        }
+
+        trace!(
+            "Assigned huffman tables {}/{} to component {j}, id={}",
+            image.components[usize::from(j)].dc_huff_table,
+            image.components[usize::from(j)].ac_huff_table,
+            image.components[usize::from(j)].id,
+        );
     }
 
     // Collect the component spec parameters
@@ -415,7 +447,7 @@ pub(crate) fn parse_sos<T: ZByteReaderTrait>(
 pub(crate) fn parse_app13<T: ZByteReaderTrait>(
     decoder: &mut JpegDecoder<T>
 ) -> Result<(), DecodeErrors> {
-    const IPTC_PREFIX: &[u8] = b"Photoshop 3.0";
+    const IPTC_PREFIX: &[u8] = b"Photoshop 3.0\0";
     // skip length.
     let mut length = usize::from(decoder.stream.get_u16_be());
 
@@ -449,12 +481,13 @@ pub(crate) fn parse_app14<T: ZByteReaderTrait>(
     if length < 2 {
         return Err(DecodeErrors::FormatStatic("Too small APP14 length"));
     }
-    if length < 14 {
-        return Err(DecodeErrors::FormatStatic(
-            "Too short of a length for App14 segment"
-        ));
-    }
+
     if decoder.stream.peek_at(0, 5)? == b"Adobe" {
+        if length < 14 {
+            return Err(DecodeErrors::FormatStatic(
+                "Too short of a length for App14 segment"
+            ));
+        }
         // move stream 6 bytes to remove adobe id
         decoder.stream.skip(6)?;
         // skip version, flags0 and flags1
@@ -477,11 +510,9 @@ pub(crate) fn parse_app14<T: ZByteReaderTrait>(
         // version =  5
         // transform = 1
         length = length.saturating_sub(14);
-    } else if decoder.options.strict_mode() {
-        return Err(DecodeErrors::FormatStatic("Corrupt Adobe App14 segment"));
     } else {
+        warn!("Not a valid Adobe APP14 Segment, skipping {} bytes", length);
         length = length.saturating_sub(2);
-        error!("Not a valid Adobe APP14 Segment");
     }
     // skip any proceeding lengths.
     // we do not need them
@@ -497,6 +528,12 @@ pub(crate) fn parse_app1<T: ZByteReaderTrait>(
     decoder: &mut JpegDecoder<T>
 ) -> Result<(), DecodeErrors> {
     const XMP_NAMESPACE_PREFIX: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+    const EXTENDED_XMP_NAMESPACE_PREFIX: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
+    const EXTENDED_XMP_GUID_SIZE: usize = 32;
+    const EXTENDED_XMP_TOTAL_SIZE_SIZE: usize = 4;
+    const EXTENDED_XMP_OFFSET_SIZE: usize = 4;
+    const EXTENDED_XMP_HEADER_SIZE: usize =
+        EXTENDED_XMP_GUID_SIZE + EXTENDED_XMP_TOTAL_SIZE_SIZE + EXTENDED_XMP_OFFSET_SIZE;
 
     // contains exif data
     let mut length = usize::from(decoder.stream.get_u16_be());
@@ -524,6 +561,36 @@ pub(crate) fn parse_app1<T: ZByteReaderTrait>(
         length -= XMP_NAMESPACE_PREFIX.len();
         let xmp_data = decoder.stream.peek_at(0, length)?.to_vec();
         decoder.info.xmp_data = Some(xmp_data);
+    } else if length > EXTENDED_XMP_NAMESPACE_PREFIX.len()
+        && decoder.stream.peek_at(0, EXTENDED_XMP_NAMESPACE_PREFIX.len())?
+            == EXTENDED_XMP_NAMESPACE_PREFIX
+    {
+        trace!("Extended XMP Data Present");
+        decoder.stream.skip(EXTENDED_XMP_NAMESPACE_PREFIX.len())?;
+        length -= EXTENDED_XMP_NAMESPACE_PREFIX.len();
+
+        if length < EXTENDED_XMP_HEADER_SIZE {
+            return Err(DecodeErrors::FormatStatic("Too small Extended XMP segment"));
+        }
+
+        let header = decoder.stream.peek_at(0, EXTENDED_XMP_HEADER_SIZE)?;
+        let guid = header[0..EXTENDED_XMP_GUID_SIZE].to_vec();
+
+        let total_size_start = EXTENDED_XMP_GUID_SIZE;
+        let total_size_end = total_size_start + EXTENDED_XMP_TOTAL_SIZE_SIZE;
+        let total_size =
+            u32::from_be_bytes(header[total_size_start..total_size_end].try_into().unwrap());
+
+        let offset_start = total_size_end;
+        let offset_end = offset_start + EXTENDED_XMP_OFFSET_SIZE;
+        let offset = u32::from_be_bytes(header[offset_start..offset_end].try_into().unwrap());
+
+        let data = decoder
+            .stream
+            .peek_at(EXTENDED_XMP_HEADER_SIZE, length - EXTENDED_XMP_HEADER_SIZE)?
+            .to_vec();
+
+        decoder.extended_xmp_segments.push(ExtendedXmpSegment { offset, total_size, guid, data });
     } else {
         warn!("Unknown format for APP1 tag, skipping");
     }
@@ -599,6 +666,7 @@ pub(crate) fn parse_app2<T: ZByteReaderTrait>(
         trace!("MPF Signature present");
         length = length.saturating_sub(MPF_DATA.len());
         decoder.stream.skip(MPF_DATA.len())?;
+        decoder.info.multi_picture_information_offset = Some(decoder.stream.position()?);
         // MPF signature taken from here
         // https://github.com/google/libultrahdr/blob/bf2aa439eea9ad5da483003fa44182f990f74091/lib/include/ultrahdr/multipictureformat.h#L50
         // https://github.com/google/libultrahdr/blob/bf2aa439eea9ad5da483003fa44182f990f74091/lib/src/multipictureformat.cpp#L36

@@ -7,6 +7,9 @@ license = "MIT"
 description = "A library to communicate with the Verifactu API"
 repository = "https://github.com/curriedsoftware/verifactu"
 
+[[bin]]
+name = "verifactu"
+
 [features]
 production = []
 
@@ -23,6 +26,10 @@ qrcode = "0.14"
 image = "0.25"
 pem = "3.0"
 pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+const-oid = "0.9"
+tokio = { version = "1.48", features = ["full"] }
+clap = { version = "4.6.1", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }

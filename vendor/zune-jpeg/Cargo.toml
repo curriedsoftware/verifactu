@@ -11,8 +11,9 @@
 
 [package]
 edition = "2021"
+rust-version = "1.75.0"
 name = "zune-jpeg"
-version = "0.5.5"
+version = "0.5.15"
 authors = ["caleb <etemesicaleb@gmail.com>"]
 build = false
 exclude = [
@@ -47,6 +48,7 @@ default = [
 ]
 log = ["zune-core/log"]
 neon = []
+portable_simd = []
 std = ["zune-core/std"]
 x86 = []
 
@@ -55,7 +57,7 @@ name = "zune_jpeg"
 path = "src/lib.rs"
 
 [dependencies.zune-core]
-version = "^0.5"
+version = "0.5.1"
 
 [dev-dependencies]
 

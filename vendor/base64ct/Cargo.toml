@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "base64ct"
-version = "1.8.0"
+version = "1.8.3"
 authors = ["RustCrypto Developers"]
 build = false
 autolib = false
@@ -21,11 +21,11 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = '''
+description = """
 Pure Rust implementation of Base64 (RFC 4648) which avoids any usages of
 data-dependent branches/LUTs and thereby provides portable "best effort"
 constant-time operation and embedded-friendly no_std support
-'''
+"""
 homepage = "https://github.com/RustCrypto/formats/tree/master/base64ct"
 documentation = "https://docs.rs/base64ct"
 readme = "README.md"
@@ -67,6 +67,10 @@ path = "tests/bcrypt.rs"
 [[test]]
 name = "crypt"
 path = "tests/crypt.rs"
+
+[[test]]
+name = "pbkdf2"
+path = "tests/pbkdf2.rs"
 
 [[test]]
 name = "proptests"

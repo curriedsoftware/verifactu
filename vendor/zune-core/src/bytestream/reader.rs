@@ -5,6 +5,8 @@ use core::fmt::Formatter;
 
 pub(crate) mod no_std_readers;
 pub(crate) mod std_readers;
+pub(crate) mod zcursor_no_std;
+
 use crate::bytestream::ZByteReaderTrait;
 
 /// Enumeration of possible methods to seek within an I/O object.
@@ -123,7 +125,7 @@ impl From<&'static str> for ZByteIoError {
 /// utilities like endian aware byte functions.
 ///
 /// This prevents each implementation from providing its own
-pub struct ZReader<T: ZByteReaderTrait> {
+pub struct ZReader<T> {
     inner:       T,
     temp_buffer: Vec<u8>
 }

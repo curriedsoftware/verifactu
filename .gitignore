@@ -16,3 +16,6 @@ devenv.local.nix
 *.p12
 *.pem
 *.png
+
+# Local environment secrets (paths to certs + key passphrase)
+.env.local

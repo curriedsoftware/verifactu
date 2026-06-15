@@ -25,11 +25,42 @@
 #[derive(Debug)]
 pub enum Error {
     RequestError(String),
+    SoapFault(crate::schema::SoapFault),
     QrCodeGenerationFailed,
     IoError(std::io::Error),
     PemError(String),
     ReqwestError(reqwest::Error),
 }
+
+#[derive(Debug)]
+pub enum DataError {
+    InvalidData(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::RequestError(message) => write!(f, "request error: {message}"),
+            Error::SoapFault(fault) => write!(f, "AEAT returned an error: {fault}"),
+            Error::QrCodeGenerationFailed => write!(f, "QR code generation failed"),
+            Error::IoError(err) => write!(f, "I/O error: {err}"),
+            Error::PemError(message) => write!(f, "PEM error: {message}"),
+            Error::ReqwestError(err) => write!(f, "reqwest error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl std::fmt::Display for DataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataError::InvalidData(message) => write!(f, "invalid data: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for DataError {}
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {

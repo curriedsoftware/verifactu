@@ -50,7 +50,7 @@ pub fn upsample_horizontal(
     let i_last = &input[input_len..];
 
     // write out manually..
-    f_out[0] = (3 * i_last[0] + i_last[1] + 2) >> 2;
+    f_out[0] = (3 * i_last[1] + i_last[0] + 2) >> 2;
     f_out[1] = i_last[1];
 }
 pub fn upsample_vertical(
@@ -79,7 +79,10 @@ pub fn upsample_hv(
 ) {
 
     assert_eq!(input.len() * 4, output.len());
-    assert_eq!(input.len() * 2, scratch_space.len());
+
+    assert!(input.len() * 2 <= scratch_space.len());
+    let scratch_space = &mut scratch_space[..input.len() * 2];
+
 
     let mut t = [0];
     upsample_vertical(input, in_near, in_far, &mut t, scratch_space);

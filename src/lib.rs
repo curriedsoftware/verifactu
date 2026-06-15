@@ -66,10 +66,19 @@ macro_rules! request {
 
         tracing::debug!(response = %response_text, "received SOAP response");
 
-        let envelope: $envelope_type = quick_xml::de::from_str(&response_text)
-            .map_err(|err| errors::Error::RequestError(format!("{:?}", err)))?;
-
-        Ok(envelope.body.payload)
+        match quick_xml::de::from_str::<$envelope_type>(&response_text) {
+            Ok(envelope) => Ok(envelope.body.payload),
+            Err(parse_err) => {
+                // AEAT signals header/authorization/format errors with a SOAP
+                // Fault in the body rather than the expected response element.
+                // Surface the fault message instead of a misleading
+                // "missing field" deserialization error.
+                match quick_xml::de::from_str::<$crate::schema::SoapFaultEnvelope>(&response_text) {
+                    Ok(fault_envelope) => Err(errors::Error::SoapFault(fault_envelope.body.fault)),
+                    Err(_) => Err(errors::Error::RequestError(format!("{:?}", parse_err))),
+                }
+            }
+        }
     }};
 }
 

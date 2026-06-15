@@ -8,6 +8,7 @@
 
 use alloc::format;
 use core::convert::TryInto;
+use core::cmp::min;
 
 use zune_core::colorspace::ColorSpace;
 
@@ -313,9 +314,12 @@ fn color_convert_ycbcr(
             let mut cb_out = [0; 16];
             let mut cr_out = [0; 16];
             // copy those small widths to that buffer
-            y_out[0..y_width.len()].copy_from_slice(y_width);
-            cb_out[0..cb_width.len()].copy_from_slice(cb_width);
-            cr_out[0..cr_width.len()].copy_from_slice(cr_width);
+            // Use a min with 16 to prevent some panics, see https://github.com/etemesi254/zune-image/issues/331
+            y_out[0..min(y_width.len(), 16)].copy_from_slice(&y_width[0..min(y_width.len(), 16)]);
+            cb_out[0..min(cb_width.len(), 16)]
+                .copy_from_slice(&cb_width[0..min(cb_width.len(), 16)]);
+            cr_out[0..min(cr_width.len(), 16)]
+                .copy_from_slice(&cr_width[0..min(cr_width.len(), 16)]);
             // we handle widths less than 16 a bit differently, allocating a temporary
             // buffer and writing to that and then flushing to the out buffer
             // because of the optimizations applied below,
@@ -371,7 +375,7 @@ fn color_convert_ycbcr(
 pub(crate) fn upsample(
     component: &mut Components, mcu_height: usize, i: usize, upsampler_scratch_space: &mut [i16],
     has_vertical_sample: bool
-) {
+) -> Result<(), DecodeErrors> {
     match component.sample_ratio {
         SampleRatios::V | SampleRatios::HV => {
             /*
@@ -427,6 +431,13 @@ pub(crate) fn upsample(
 
             let stride = component.width_stride * component.vertical_sample;
             let stop_offset = component.raw_coeff.len() / component.width_stride;
+
+            if component.raw_coeff.len() != stop_offset * stride {
+                // slice would panic below
+                return Err(DecodeErrors::FormatStatic(
+                    "Invalid component dimensions, would panic"
+                ));
+            }
             for (pos, curr_row) in component
                 .raw_coeff
                 .chunks_exact(component.width_stride)
@@ -555,11 +566,12 @@ pub(crate) fn upsample(
                 .chunks_exact(component.width_stride)
                 .zip(dest_coeff.chunks_exact_mut(component.width_stride * h * v))
             {
-                // upsample using the fn pointer, should only be H, so no need for
-                // row up and row down
-                (component.up_sampler)(single_row, &[], &[], &mut [], output_stride);
+                for row in output_stride.chunks_exact_mut(component.width_stride * h) {
+                    (component.up_sampler)(single_row, &[], &[], &mut [], row);
+                }
             }
         }
         SampleRatios::None => {}
     };
+    Ok(())
 }

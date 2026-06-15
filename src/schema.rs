@@ -566,6 +566,41 @@ pub enum Periodo {
     Diciembre,
 }
 
+impl TryFrom<&str> for Periodo {
+    type Error = ValidationError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Ok(match value {
+            "01" => Periodo::Enero,
+            "02" => Periodo::Febrero,
+            "03" => Periodo::Marzo,
+            "04" => Periodo::Abril,
+            "05" => Periodo::Mayo,
+            "06" => Periodo::Junio,
+            "07" => Periodo::Julio,
+            "08" => Periodo::Agosto,
+            "09" => Periodo::Septiembre,
+            "10" => Periodo::Octubre,
+            "11" => Periodo::Noviembre,
+            "12" => Periodo::Diciembre,
+            other => {
+                return Err(ValidationError::new(
+                    "Periodo",
+                    format!("expected a month code \"01\"..\"12\", got {other:?}"),
+                ));
+            }
+        })
+    }
+}
+
+impl TryFrom<String> for Periodo {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Periodo::try_from(value.as_str())
+    }
+}
+
 /// Identifies a party by exactly one of a Spanish NIF or a foreign identifier
 /// (`IDOtro`). Modeled as a sum type so that the "neither" and "both" states —
 /// which the AEAT schema rejects — are unrepresentable.
@@ -2514,4 +2549,45 @@ pub struct SoapBodyConsulta<T> {
 pub struct SoapBodyReg<T> {
     #[serde(rename = "RegFactuSistemaFacturacion")]
     pub payload: T,
+}
+
+/// SOAP envelope carrying a `<Fault>` in its body. AEAT returns this (rather
+/// than the expected response element) for header/authorization/format errors,
+/// e.g. an `ObligadoEmision` NIF that is malformed, unknown or not authorized.
+#[derive(Debug, Deserialize)]
+pub struct SoapFaultEnvelope {
+    #[serde(rename = "Header")]
+    pub _header: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "Body")]
+    pub body: SoapFaultBody,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SoapFaultBody {
+    #[serde(rename = "Fault")]
+    pub fault: SoapFault,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SoapFault {
+    #[serde(rename = "faultcode")]
+    pub faultcode: String,
+    #[serde(rename = "faultstring")]
+    pub faultstring: String,
+}
+
+impl SoapFault {
+    /// AEAT prefixes the fault string with `Codigo[NNNN].`. When present,
+    /// return the bare numeric code so callers can match on it.
+    pub fn codigo(&self) -> Option<&str> {
+        self.faultstring
+            .strip_prefix("Codigo[")
+            .and_then(|rest| rest.split(']').next())
+    }
+}
+
+impl std::fmt::Display for SoapFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.faultstring, self.faultcode)
+    }
 }
