@@ -19,3 +19,9 @@ devenv.local.nix
 
 # Secrets
 .env.local
+
+# Vendored third-party crate sources are committed in full and must build
+# offline. The secrets/build-artifact rules above (and any global excludes,
+# e.g. *.o) must not strip their fixtures and pregenerated objects — ring's
+# pregenerated *.o, *.pem/*.png test fixtures, etc.
+!vendor/**

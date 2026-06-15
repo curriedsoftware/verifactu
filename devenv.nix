@@ -28,26 +28,22 @@
   outputs = {
     verifactu = pkgs.rustPlatform.buildRustPackage {
       name = "verifactu";
-      cargoLock.lockFile = ./Cargo.nix.lock;
-      postPatch = ''
-        ln -s ${./Cargo.nix.lock} Cargo.lock
-      '';
-      buildPhase = ''
-        runHook preBuild
-        cargo build --release --examples
-        runHook postBuild
-      '';
-      installPhase = ''
-        runHook preInstall
-        mkdir -p $out/bin
-        ls -1 $src/examples | sed 's/\.rs$//' | \
-          xargs -I{} sh -c 'cp target/release/examples/{} $out/bin/$(echo {} | sed 's/_/-/g')'
-        runHook postInstall
-      '';
       src = ./.;
-      env = {
-        GIT_REVISION = "devenv";
+      # Build from the committed ./vendor sources (offline). Cargo.lock is
+      # gitignored; symlink the tracked Cargo.nix.lock into place for cargo.
+      cargoVendorDir = "vendor";
+      cargoLock = {
+        lockFile = ./Cargo.nix.lock;
+        allowBuiltinFetchGit = true;
       };
+      postPatch = ''
+        ln -sf ${./Cargo.nix.lock} Cargo.lock
+      '';
+      cargoBuildFlags = ["--bin" "verifactu"];
+      # The test-suite talks to the AEAT web service / replays recorded
+      # responses, so it can't run inside the sandboxed build.
+      doCheck = false;
+      meta.mainProgram = "verifactu";
     };
   };
 }
