@@ -27,6 +27,7 @@ use std::{env, error::Error, fs};
 use clap::{Args, Parser, Subcommand, command};
 use const_oid::ObjectIdentifier;
 use pkcs8::{EncryptedPrivateKeyInfo, der::Decode};
+use prettytable::{Table, format, row};
 use quick_xml::se::to_string;
 use reqwest::{Client, Identity};
 use verifactu::{
@@ -34,6 +35,7 @@ use verifactu::{
     errors::DataError,
     schema::{
         Identificador, PeriodoImputacion as SchemaPeriodoImputacion, PersonaFisicaJuridicaConsulta,
+        RespuestaConsultaLR, SiNo,
     },
 };
 use x509_cert::{Certificate, der::DecodePem};
@@ -171,12 +173,99 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let xml_output = to_string(&result).expect("serialization should not fail");
                 println!("{}", xml_output);
             } else {
-                println!("{result:?}");
+                print_consulta_table(&result);
             }
         }
     }
 
     Ok(())
+}
+
+/// Render a `consulta` response as a human-readable table using `prettytable`.
+fn print_consulta_table(result: &RespuestaConsultaLR) {
+    println!(
+        "Periodo: {}/{:?}  ·  Resultado: {:?}  ·  Registros: {}",
+        result.periodo_imputacion.ejercicio,
+        result.periodo_imputacion.periodo,
+        result.resultado_consulta,
+        result.registros.len(),
+    );
+
+    if result.registros.is_empty() {
+        println!("No hay registros.");
+        return;
+    }
+
+    // Stringify an optional field, falling back to a dash when absent.
+    fn opt<T: std::fmt::Display>(value: &Option<T>) -> String {
+        value
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".to_owned())
+    }
+
+    let mut table = Table::new();
+    let mut table_format = *format::consts::FORMAT_BOX_CHARS;
+    // Set the title row off from the data with a heavier double-line border.
+    table_format.separator(
+        format::LinePosition::Title,
+        format::LineSeparator::new('═', '╪', '╞', '╡'),
+    );
+    table.set_format(table_format);
+    table.set_titles(row![
+        "NIF Emisor",
+        "Núm. Serie",
+        "Fecha Exp.",
+        "Destinatario",
+        "Subsanación",
+        "Tipo",
+        "Importe Total",
+        "Cuota Total",
+        "Estado",
+    ]);
+
+    // Recipient name, condensed: show the first and a "+N" hint when there are more.
+    fn destinatario(datos: &verifactu::schema::RespuestaDatosRegistroFacturacion) -> String {
+        match &datos.destinatarios {
+            Some(d) => {
+                let first = d
+                    .destinatarios
+                    .first()
+                    .map(|dest| dest.nombre_razon.to_string())
+                    .unwrap_or_else(|| "-".to_owned());
+                match d.destinatarios.len() {
+                    0 | 1 => first,
+                    n => format!("{first} (+{})", n - 1),
+                }
+            }
+            None => "-".to_owned(),
+        }
+    }
+
+    for registro in &result.registros {
+        let datos = &registro.datos_registro_facturacion;
+        table.add_row(row![
+            registro.id_factura.id_emisor_factura,
+            registro.id_factura.num_serie_factura,
+            registro.id_factura.fecha_expedicion_factura,
+            destinatario(datos),
+            match datos.subsanacion {
+                Some(SiNo::S) => "Sí",
+                Some(SiNo::N) => "No",
+                Some(SiNo::X) | None => "-",
+            },
+            datos
+                .tipo_factura
+                .as_ref()
+                .map(|tipo| format!("{tipo:?}"))
+                .unwrap_or_else(|| "-".to_owned()),
+            opt(&datos.importe_total),
+            opt(&datos.cuota_total),
+            format!("{:?}", registro.estado_registro.estado_registro),
+        ]);
+    }
+
+    table.printstd();
 }
 
 /// Read the AEAT certificate PEM from the path in `VERIFACTU_CERTIFICATE_PEM_PATH`.

@@ -2285,6 +2285,15 @@ pub struct RespuestaSuministro {
 pub struct CabeceraRespuesta {
     #[serde(rename = "ObligadoEmision")]
     pub obligado_emision: PersonaFisicaJuridicaES,
+    #[serde(rename = "Representante", skip_serializing_if = "Option::is_none")]
+    pub representante: Option<PersonaFisicaJuridicaES>,
+    #[serde(rename = "RemisionVoluntaria", skip_serializing_if = "Option::is_none")]
+    pub remision_voluntaria: Option<RemisionVoluntaria>,
+    #[serde(
+        rename = "RemisionRequerimiento",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remision_requerimiento: Option<RemisionRequerimiento>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2316,7 +2325,25 @@ pub struct RegistroDuplicado {
     #[serde(rename = "IdPeticionRegistroDuplicado")]
     pub id_peticion_registro_duplicado: String,
     #[serde(rename = "EstadoRegistroDuplicado")]
-    pub estado_registro_duplicado: String,
+    pub estado_registro_duplicado: EstadoRegistroDuplicado,
+    #[serde(
+        rename = "CodigoErrorRegistro",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codigo_error_registro: Option<u32>,
+    #[serde(
+        rename = "DescripcionErrorRegistro",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub descripcion_error_registro: Option<String>,
+}
+
+// EstadoRegistroSFType in SuministroInformacion.xsd.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EstadoRegistroDuplicado {
+    Correcta,
+    AceptadaConErrores,
+    Anulada,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2333,6 +2360,12 @@ pub struct IDFacturaRespuesta {
 pub struct OperacionRespuesta {
     #[serde(rename = "TipoOperacion")]
     pub tipo_operacion: TipoOperacion,
+    #[serde(rename = "Subsanacion", skip_serializing_if = "Option::is_none")]
+    pub subsanacion: Option<SiNo>,
+    #[serde(rename = "RechazoPrevio", skip_serializing_if = "Option::is_none")]
+    pub rechazo_previo: Option<SiNo>,
+    #[serde(rename = "SinRegistroPrevio", skip_serializing_if = "Option::is_none")]
+    pub sin_registro_previo: Option<SiNo>,
 }
 
 // Query response structures
@@ -2384,8 +2417,6 @@ pub struct RegistroRespuestaConsultaRegFacturacion {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatosPresentacion {
-    #[serde(rename = "CSV", skip_serializing_if = "Option::is_none")]
-    pub csv: Option<String>,
     #[serde(rename = "NIFPresentador", skip_serializing_if = "Option::is_none")]
     pub nif_presentador: Option<NIF>,
     #[serde(
@@ -2393,6 +2424,10 @@ pub struct DatosPresentacion {
         skip_serializing_if = "Option::is_none"
     )]
     pub timestamp_presentacion: Option<String>,
+    // Only present in the consulta response (DatosPresentacion2Type); absent
+    // from the suministro response (DatosPresentacionType).
+    #[serde(rename = "IdPeticion", skip_serializing_if = "Option::is_none")]
+    pub id_peticion: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2413,16 +2448,60 @@ pub struct EstadoRegFactu {
     pub descripcion_error_registro: Option<TextMax500>,
 }
 
+// Wrapper for the rectified-invoice list in a consulta response
+// (FacturasRectificadas -> IDFacturaRectificada*, IDFacturaARType).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FacturasRectificadas {
+    #[serde(rename = "IDFacturaRectificada", alias = "sum1:IDFacturaRectificada")]
+    pub facturas: Vec<IDFactura>,
+}
+
+// Wrapper for the substituted-invoice list in a consulta response
+// (FacturasSustituidas -> IDFacturaSustituida*, IDFacturaARType).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FacturasSustituidas {
+    #[serde(rename = "IDFacturaSustituida", alias = "sum1:IDFacturaSustituida")]
+    pub facturas: Vec<IDFactura>,
+}
+
+// Field sequence mirrors RespuestaDatosRegistroFacturacionType in
+// RespuestaConsultaLR.xsd. Every element is optional (minOccurs=0). Note this
+// type intentionally has no IDVersion: the consulta response does not echo it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RespuestaDatosRegistroFacturacion {
-    #[serde(rename = "IDVersion", skip_serializing_if = "Option::is_none")]
-    pub id_version: Option<StringMax16>,
     #[serde(rename = "NombreRazonEmisor", skip_serializing_if = "Option::is_none")]
     pub nombre_razon_emisor: Option<StringMax120>,
+    #[serde(rename = "RefExterna", skip_serializing_if = "Option::is_none")]
+    pub ref_externa: Option<TextMax60>,
+    #[serde(rename = "Subsanacion", skip_serializing_if = "Option::is_none")]
+    pub subsanacion: Option<SiNo>,
+    #[serde(rename = "RechazoPrevio", skip_serializing_if = "Option::is_none")]
+    pub rechazo_previo: Option<SiNo>,
+    #[serde(rename = "SinRegistroPrevio", skip_serializing_if = "Option::is_none")]
+    pub sin_registro_previo: Option<SiNo>,
+    #[serde(rename = "GeneradoPor", skip_serializing_if = "Option::is_none")]
+    pub generado_por: Option<GeneradoPor>,
+    #[serde(rename = "Generador", skip_serializing_if = "Option::is_none")]
+    pub generador: Option<PersonaFisicaJuridicaConsulta>,
     #[serde(rename = "TipoFactura", skip_serializing_if = "Option::is_none")]
     pub tipo_factura: Option<TipoFactura>,
     #[serde(rename = "TipoRectificativa", skip_serializing_if = "Option::is_none")]
     pub tipo_rectificativa: Option<TipoRectificativa>,
+    #[serde(
+        rename = "FacturasRectificadas",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub facturas_rectificadas: Option<FacturasRectificadas>,
+    #[serde(
+        rename = "FacturasSustituidas",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub facturas_sustituidas: Option<FacturasSustituidas>,
+    #[serde(
+        rename = "ImporteRectificacion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub importe_rectificacion: Option<ImporteRectificacion>,
     #[serde(rename = "FechaOperacion", skip_serializing_if = "Option::is_none")]
     pub fecha_operacion: Option<Fecha>,
     #[serde(
@@ -2447,6 +2526,10 @@ pub struct RespuestaDatosRegistroFacturacion {
         skip_serializing_if = "Option::is_none"
     )]
     pub emitida_por_tercero_o_destinatario: Option<GeneradoPor>,
+    #[serde(rename = "Tercero", skip_serializing_if = "Option::is_none")]
+    pub tercero: Option<PersonaFisicaJuridicaConsulta>,
+    #[serde(rename = "Destinatarios", skip_serializing_if = "Option::is_none")]
+    pub destinatarios: Option<Destinatarios>,
     #[serde(rename = "Cupon", skip_serializing_if = "Option::is_none")]
     pub cupon: Option<SiNo>,
     #[serde(rename = "Desglose", skip_serializing_if = "Option::is_none")]
@@ -2459,10 +2542,31 @@ pub struct RespuestaDatosRegistroFacturacion {
     pub encadenamiento: Option<Encadenamiento>,
     #[serde(rename = "SistemaInformatico", skip_serializing_if = "Option::is_none")]
     pub sistema_informatico: Option<SistemaInformatico>,
+    #[serde(
+        rename = "FechaHoraHusoGenRegistro",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fecha_hora_huso_gen_registro: Option<String>, // dateTime with timezone
+    #[serde(
+        rename = "NumRegistroAcuerdoFacturacion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub num_registro_acuerdo_facturacion: Option<StringMax15>,
+    #[serde(
+        rename = "IdAcuerdoSistemaInformatico",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub id_acuerdo_sistema_informatico: Option<StringMax16>,
+    #[serde(rename = "TipoHuella", skip_serializing_if = "Option::is_none")]
+    pub tipo_huella: Option<TipoHuella>,
     #[serde(rename = "Huella", skip_serializing_if = "Option::is_none")]
     pub huella: Option<StringMax64>,
-    #[serde(rename = "RefExterna", skip_serializing_if = "Option::is_none")]
-    pub ref_externa: Option<TextMax60>,
+    #[serde(rename = "NifRepresentante", skip_serializing_if = "Option::is_none")]
+    pub nif_representante: Option<NIF>,
+    #[serde(rename = "FechaFinVeriFactu", skip_serializing_if = "Option::is_none")]
+    pub fecha_fin_verifactu: Option<Fecha>,
+    #[serde(rename = "Incidencia", skip_serializing_if = "Option::is_none")]
+    pub incidencia: Option<Incidencia>,
 }
 
 #[derive(Deserialize, Serialize)]
