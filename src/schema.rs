@@ -1682,8 +1682,36 @@ pub struct IDFacturaAnulada {
 // constructed.
 #[derive(Debug, Clone)]
 pub enum Encadenamiento {
-    PrimerRegistro(SiNo),
+    /// This record is the first of the chain. Per the AEAT XSD
+    /// (`PrimerRegistroCadenaType`) the element value is fixed to "S", so the
+    /// variant carries no data — `N` is not a representable (or valid) state.
+    PrimerRegistro,
     RegistroAnterior(RegistroAnterior),
+}
+
+/// The `PrimerRegistro` element value. The AEAT XSD restricts
+/// `PrimerRegistroCadenaType` to the single enumeration value "S", so this type
+/// holds no data and always (de)serializes as the string "S".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrimerRegistroMarker;
+
+impl Serialize for PrimerRegistroMarker {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("S")
+    }
+}
+
+impl<'de> Deserialize<'de> for PrimerRegistroMarker {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value == "S" {
+            Ok(PrimerRegistroMarker)
+        } else {
+            Err(D::Error::custom(format!(
+                "PrimerRegistro must be 'S', got '{value}'"
+            )))
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1693,7 +1721,7 @@ struct EncadenamientoWire {
         alias = "PrimerRegistro",
         skip_serializing_if = "Option::is_none"
     )]
-    primer_registro: Option<SiNo>,
+    primer_registro: Option<PrimerRegistroMarker>,
     #[serde(
         rename = "sum1:RegistroAnterior",
         alias = "RegistroAnterior",
@@ -1705,7 +1733,7 @@ struct EncadenamientoWire {
 impl Serialize for Encadenamiento {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let (primer_registro, registro_anterior) = match self {
-            Encadenamiento::PrimerRegistro(value) => (Some(value.clone()), None),
+            Encadenamiento::PrimerRegistro => (Some(PrimerRegistroMarker), None),
             Encadenamiento::RegistroAnterior(registro) => (None, Some(registro.clone())),
         };
         EncadenamientoWire {
@@ -1720,7 +1748,7 @@ impl<'de> Deserialize<'de> for Encadenamiento {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = EncadenamientoWire::deserialize(deserializer)?;
         match (wire.primer_registro, wire.registro_anterior) {
-            (Some(value), None) => Ok(Encadenamiento::PrimerRegistro(value)),
+            (Some(_), None) => Ok(Encadenamiento::PrimerRegistro),
             (None, Some(registro)) => Ok(Encadenamiento::RegistroAnterior(registro)),
             (Some(_), Some(_)) => Err(D::Error::custom(
                 "Encadenamiento cannot have both PrimerRegistro and RegistroAnterior",
@@ -1932,6 +1960,99 @@ pub struct ImporteRectificacion {
     pub cuota_recargo_rectificado: Option<ImporteSgn12_2>,
 }
 
+/// Serde adapter for the submission `FacturasRectificadas` element. The AEAT
+/// XSD (`RegistroFacturacionAltaType`) nests each reference in an
+/// `<IDFacturaRectificada>` element inside `<FacturasRectificadas>`. A bare
+/// `Vec<IDFactura>` under the `sum1:FacturasRectificadas` field name would
+/// instead serialize as repeated `<FacturasRectificadas>` elements with the
+/// `IDFactura` fields inlined, which AEAT rejects with error 4102. This adapter
+/// re-introduces the required `<IDFacturaRectificada>` wrapper while keeping the
+/// ergonomic `Option<Vec<IDFactura>>` field type.
+mod facturas_rectificadas_serde {
+    use super::IDFactura;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct WrapperRef<'a> {
+        #[serde(rename = "sum1:IDFacturaRectificada")]
+        id_factura_rectificada: &'a [IDFactura],
+    }
+
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(
+            rename = "sum1:IDFacturaRectificada",
+            alias = "IDFacturaRectificada",
+            default
+        )]
+        id_factura_rectificada: Vec<IDFactura>,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<Vec<IDFactura>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(facturas) => WrapperRef {
+                id_factura_rectificada: facturas,
+            }
+            .serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<IDFactura>>, D::Error> {
+        let wrapper = Option::<Wrapper>::deserialize(deserializer)?;
+        Ok(wrapper.map(|w| w.id_factura_rectificada))
+    }
+}
+
+/// Serde adapter for the submission `FacturasSustituidas` element — the
+/// substituted-invoice counterpart of [`facturas_rectificadas_serde`], nesting
+/// each reference in `<IDFacturaSustituida>` per the AEAT XSD.
+mod facturas_sustituidas_serde {
+    use super::IDFactura;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct WrapperRef<'a> {
+        #[serde(rename = "sum1:IDFacturaSustituida")]
+        id_factura_sustituida: &'a [IDFactura],
+    }
+
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(
+            rename = "sum1:IDFacturaSustituida",
+            alias = "IDFacturaSustituida",
+            default
+        )]
+        id_factura_sustituida: Vec<IDFactura>,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<Vec<IDFactura>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(facturas) => WrapperRef {
+                id_factura_sustituida: facturas,
+            }
+            .serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<IDFactura>>, D::Error> {
+        let wrapper = Option::<Wrapper>::deserialize(deserializer)?;
+        Ok(wrapper.map(|w| w.id_factura_sustituida))
+    }
+}
+
 // Main invoice registration structure (alta = new registration)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistroFacturacionAlta {
@@ -1967,18 +2088,26 @@ pub struct RegistroFacturacionAlta {
         skip_serializing_if = "Option::is_none"
     )]
     pub tipo_rectificativa: Option<TipoRectificativa>,
-    /// Maximum 1000 entries as per XSD specification (maxOccurs=1000)
+    /// Maximum 1000 entries as per XSD specification (maxOccurs=1000).
+    /// Each reference is nested in an `<IDFacturaRectificada>` element inside
+    /// `<FacturasRectificadas>` per the AEAT XSD; see [`facturas_rectificadas_serde`].
     #[serde(
         rename = "sum1:FacturasRectificadas",
         alias = "FacturasRectificadas",
-        skip_serializing_if = "Option::is_none"
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "facturas_rectificadas_serde"
     )]
     pub facturas_rectificadas: Option<Vec<IDFactura>>,
-    /// Maximum 1000 entries as per XSD specification (maxOccurs=1000)
+    /// Maximum 1000 entries as per XSD specification (maxOccurs=1000).
+    /// Each reference is nested in an `<IDFacturaSustituida>` element inside
+    /// `<FacturasSustituidas>` per the AEAT XSD; see [`facturas_sustituidas_serde`].
     #[serde(
         rename = "sum1:FacturasSustituidas",
         alias = "FacturasSustituidas",
-        skip_serializing_if = "Option::is_none"
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "facturas_sustituidas_serde"
     )]
     pub facturas_sustituidas: Option<Vec<IDFactura>>,
     #[serde(
