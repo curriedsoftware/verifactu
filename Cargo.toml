@@ -10,9 +10,6 @@ repository = "https://github.com/curriedsoftware/verifactu"
 [[bin]]
 name = "verifactu"
 
-[features]
-production = []
-
 [dependencies]
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }

@@ -22,7 +22,12 @@
  * SOFTWARE.
  ***/
 
-use std::{env, error::Error, fs};
+use std::{
+    env,
+    error::Error,
+    fs,
+    io::{self, Write},
+};
 
 use clap::{Args, Parser, Subcommand, command};
 use const_oid::ObjectIdentifier;
@@ -31,7 +36,7 @@ use prettytable::{Table, format, row};
 use quick_xml::se::to_string;
 use reqwest::{Client, Identity};
 use verifactu::{
-    self,
+    self, Environment,
     errors::DataError,
     schema::{
         Identificador, PeriodoImputacion as SchemaPeriodoImputacion, PersonaFisicaJuridicaConsulta,
@@ -132,6 +137,16 @@ enum Command {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// Target the REAL AEAT production systems instead of the test
+    /// ("preproducción") environment. Submissions to production are legally
+    /// binding; you will be asked to confirm interactively unless `--yes` is
+    /// also given. Without this flag, the safe test environment is used.
+    #[arg(long, global = true)]
+    production: bool,
+    /// Skip the interactive confirmation prompt when targeting production.
+    /// Intended for non-interactive/automated use; use with care.
+    #[arg(long, global = true)]
+    yes: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -147,17 +162,18 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    let environment = resolve_environment(cli.production, cli.yes)?;
+
     match cli.command {
         Command::Consulta {
             filtro,
             obligado_emision,
             xml,
         } => {
-            let client = build_verifactu_client()?;
+            let client = build_verifactu_client(environment)?;
             let obligado_emision = build_obligado_emision(obligado_emision)?;
-            let result = verifactu::consulta(
-                &client,
-                &verifactu::schema::ConsultaFactuSistemaFacturacion {
+            let result = client
+                .consulta(&verifactu::schema::ConsultaFactuSistemaFacturacion {
                     cabecera: verifactu::schema::CabeceraConsulta {
                         id_version: "1.0".try_into()?,
                         obligado_emision: Some(obligado_emision),
@@ -166,9 +182,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     filtro_consulta: filtro.try_into()?,
                     datos_adicionales_respuesta: None,
-                },
-            )
-            .await?;
+                })
+                .await?;
             if xml {
                 let xml_output = to_string(&result).expect("serialization should not fail");
                 println!("{}", xml_output);
@@ -374,10 +389,39 @@ fn strip_nif_prefix(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-/// Build a TLS-mutual-auth-ready reqwest client using the certificate/key paths
-/// and passphrase pointed to by the `VERIFACTU_*` environment variables (loaded
-/// from `.env.local` via direnv during development).
-fn build_verifactu_client() -> Result<Client, Box<dyn Error>> {
+/// Resolve which AEAT environment to target from the CLI flags. Defaults to the
+/// safe test environment; production requires the explicit `--production` flag
+/// and, unless `--yes` is given, an interactive confirmation typed by the user.
+/// This is the application-level guardrail that keeps production from being hit
+/// by mistake.
+fn resolve_environment(production: bool, assume_yes: bool) -> Result<Environment, Box<dyn Error>> {
+    if !production {
+        eprintln!("Environment: TEST (preproducción)");
+        return Ok(Environment::Test);
+    }
+
+    if !assume_yes {
+        eprintln!("⚠️  You are about to target the AEAT PRODUCTION environment.");
+        eprintln!("⚠️  Requests sent here submit REAL, legally binding fiscal records.");
+        eprint!("Type 'production' to continue: ");
+        io::stderr().flush().ok();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if input.trim() != "production" {
+            return Err("production confirmation not given; aborting".into());
+        }
+    }
+
+    eprintln!("Environment: PRODUCTION");
+    Ok(Environment::Production)
+}
+
+/// Build a TLS-mutual-auth-ready VeriFactu client bound to `environment`, using
+/// the certificate/key paths and passphrase pointed to by the `VERIFACTU_*`
+/// environment variables (loaded from `.env.local` via direnv during
+/// development).
+fn build_verifactu_client(environment: Environment) -> Result<verifactu::Client, Box<dyn Error>> {
     let private_key_path = env::var(PRIVATE_KEY_ENV).map_err(|err| {
         format!("missing {PRIVATE_KEY_ENV} environment variable with path to private key: {err}")
     })?;
@@ -408,8 +452,10 @@ fn build_verifactu_client() -> Result<Client, Box<dyn Error>> {
     let identity = Identity::from_pem(pem_data.as_bytes())
         .map_err(|err| format!("invalid identity: {err}"))?;
 
-    Client::builder()
+    let http = Client::builder()
         .identity(identity)
         .build()
-        .map_err(|err| format!("failed to build reqwest client: {err}").into())
+        .map_err(|err| format!("failed to build reqwest client: {err}"))?;
+
+    Ok(verifactu::Client::new(http, environment))
 }

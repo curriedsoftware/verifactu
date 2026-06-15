@@ -12,7 +12,7 @@ A Rust library for communicating with the Spanish Tax Agency's VERI*FACTU system
 - **XML serialization/deserialization** using `quick-xml` and `serde`
 - **QR code generation** for invoice verification
 - **Request validation** with proper error handling
-- **Production and development modes** via feature flags
+- **Test and production environments** selected at runtime, defaulting to the safe test environment
 - **Comprehensive test suite** with real-world examples
 
 ## Installation
@@ -24,9 +24,26 @@ Add this to your `Cargo.toml`:
 verifactu = "0.1"
 ```
 
-For production use:
+## Choosing the environment
 
-```toml
-[dependencies]
-verifactu = { version = "0.1", features = ["production"] }
+The target AEAT environment is a runtime choice, not a build flag. It defaults
+to the safe test ("preproducción") environment, so reaching production always
+requires an explicit, visible opt-in:
+
+```rust
+use verifactu::{Client, Environment};
+
+// Test environment (the default).
+let client = Client::new(http, Environment::Test);
+
+// Production — submissions here are legally binding.
+let client = Client::new(http, Environment::Production);
+
+// Or resolve from the VERIFACTU_ENV variable (defaults to Test;
+// only VERIFACTU_ENV=production selects production).
+let client = Client::new(http, Environment::from_env());
 ```
+
+The `verifactu` CLI defaults to the test environment and only targets production
+when passed `--production`, prompting for interactive confirmation first (use
+`--yes` to skip the prompt in automation).

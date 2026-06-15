@@ -494,22 +494,12 @@ impl NIF {
     }
 
     fn validate(value: &str) -> Result<(), ValidationError> {
-        // In production mode, enforce strict 9-character NIF validation
-        #[cfg(feature = "production")]
-        {
-            if value.len() != 9 {
-                return Err(ValidationError::new(
-                    "NIF",
-                    format!("must be exactly 9 characters, got {}", value.len()),
-                ));
-            }
-        }
-        // In development/test mode, allow any non-empty string
-        #[cfg(not(feature = "production"))]
-        {
-            if value.is_empty() {
-                return Err(ValidationError::new("NIF", "cannot be empty"));
-            }
+        // NIF format is enforced server-side by AEAT, and the public examples
+        // use placeholders such as "AAAA", so we only reject the empty string
+        // here. Validation strictness is deliberately independent of the target
+        // environment (test vs. production), which is now a runtime concern.
+        if value.is_empty() {
+            return Err(ValidationError::new("NIF", "cannot be empty"));
         }
         Ok(())
     }

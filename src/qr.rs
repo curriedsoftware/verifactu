@@ -22,7 +22,7 @@
  * SOFTWARE.
  ***/
 
-use crate::{endpoints::QR_URL, errors::Error};
+use crate::{endpoints::Environment, errors::Error};
 use image::Luma;
 use qrcode::QrCode;
 use url::Url;
@@ -51,8 +51,8 @@ macro_rules! impl_qr {
 }
 
 impl RegistroFacturacionAlta {
-    pub fn uri(&self) -> String {
-        let mut uri = Url::parse(QR_URL).expect("valid URL");
+    pub fn uri(&self, environment: Environment) -> String {
+        let mut uri = Url::parse(environment.endpoints().qr_url).expect("valid URL");
         uri.set_query(Some(&format!(
             "nif={}&numserie={}&fecha={}&importe={}",
             encode(self.id_factura.id_emisor_factura.as_str()),
@@ -63,14 +63,14 @@ impl RegistroFacturacionAlta {
         uri.to_string()
     }
 
-    pub fn qr(&self, size: u32) -> Result<Vec<u8>, Error> {
-        Ok(impl_qr!(self.uri(), size))
+    pub fn qr(&self, environment: Environment, size: u32) -> Result<Vec<u8>, Error> {
+        Ok(impl_qr!(self.uri(environment), size))
     }
 }
 
 impl RegistroFacturacionAnulacion {
-    pub fn uri(&self, importe_total: &str) -> String {
-        let mut uri = Url::parse(QR_URL).expect("valid URL");
+    pub fn uri(&self, environment: Environment, importe_total: &str) -> String {
+        let mut uri = Url::parse(environment.endpoints().qr_url).expect("valid URL");
         uri.set_query(Some(&format!(
             "nif={}&numserie={}&fecha={}&importe={}",
             encode(self.id_factura.id_emisor_factura_anulada.as_str()),
@@ -81,7 +81,12 @@ impl RegistroFacturacionAnulacion {
         uri.to_string()
     }
 
-    pub fn qr(&self, importe_total: &str, size: u32) -> Result<Vec<u8>, Error> {
-        Ok(impl_qr!(self.uri(importe_total), size))
+    pub fn qr(
+        &self,
+        environment: Environment,
+        importe_total: &str,
+        size: u32,
+    ) -> Result<Vec<u8>, Error> {
+        Ok(impl_qr!(self.uri(environment, importe_total), size))
     }
 }
