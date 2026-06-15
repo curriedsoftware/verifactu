@@ -244,15 +244,55 @@ impl Client {
         )
     }
 
+    /// Query the invoice register, transparently following pagination.
+    ///
+    /// AEAT caps each response at a fixed number of records and signals
+    /// continuation with `IndicadorPaginacion::S` plus a `ClavePaginacion`
+    /// cursor. This method drives that loop internally: it issues as many
+    /// requests as needed, feeding each returned cursor back into the filter,
+    /// and returns a single response whose `registros` hold the complete set
+    /// across all pages. The aggregated response therefore always reports
+    /// `IndicadorPaginacion::N` and no `ClavePaginacion`.
     pub async fn consulta(
         &self,
         record: &schema::ConsultaFactuSistemaFacturacion,
     ) -> Result<schema::RespuestaConsultaLR, errors::Error> {
-        request!(
-            self,
-            record,
-            sistema_verifactu,
-            schema::SoapEnvelopeRespuestaConsulta<schema::RespuestaConsultaLR>
-        )
+        // Clone so we can advance the pagination cursor across pages without
+        // mutating the caller's request.
+        let mut record = record.clone();
+        let mut aggregated: Option<schema::RespuestaConsultaLR> = None;
+
+        loop {
+            let page = request!(
+                self,
+                record,
+                sistema_verifactu,
+                schema::SoapEnvelopeRespuestaConsulta<schema::RespuestaConsultaLR>
+            )?;
+
+            let has_more = matches!(page.indicador_paginacion, schema::IndicadorPaginacion::S);
+            let next_cursor = page.clave_paginacion.clone();
+
+            match &mut aggregated {
+                None => aggregated = Some(page),
+                Some(acc) => acc.registros.extend(page.registros),
+            }
+
+            // Continue only while AEAT both flags more data and hands back a
+            // cursor to resume from; absent either, this was the final page.
+            match (has_more, next_cursor) {
+                (true, Some(cursor)) => {
+                    record.filtro_consulta.clave_paginacion = Some(cursor);
+                }
+                _ => break,
+            }
+        }
+
+        let mut result = aggregated.expect("the pagination loop always fetches at least one page");
+        // The aggregated response now represents the full data set: there are
+        // no further pages for the caller to fetch.
+        result.indicador_paginacion = schema::IndicadorPaginacion::N;
+        result.clave_paginacion = None;
+        Ok(result)
     }
 }
