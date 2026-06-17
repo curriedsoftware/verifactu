@@ -2439,6 +2439,14 @@ pub struct RespuestaLinea {
     pub registro_duplicado: Option<RegistroDuplicado>,
 }
 
+impl RespuestaLinea {
+    /// The typed backend error code reported for this record, if any.
+    pub fn backend_error(&self) -> Option<crate::errors::BackendError> {
+        self.codigo_error_registro
+            .map(crate::errors::BackendError::from_code)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistroDuplicado {
     #[serde(rename = "IdPeticionRegistroDuplicado")]
@@ -2455,6 +2463,14 @@ pub struct RegistroDuplicado {
         skip_serializing_if = "Option::is_none"
     )]
     pub descripcion_error_registro: Option<String>,
+}
+
+impl RegistroDuplicado {
+    /// The typed backend error code reported for this duplicate record, if any.
+    pub fn backend_error(&self) -> Option<crate::errors::BackendError> {
+        self.codigo_error_registro
+            .map(crate::errors::BackendError::from_code)
+    }
 }
 
 // EstadoRegistroSFType in SuministroInformacion.xsd.
@@ -2565,6 +2581,14 @@ pub struct EstadoRegFactu {
         skip_serializing_if = "Option::is_none"
     )]
     pub descripcion_error_registro: Option<TextMax500>,
+}
+
+impl EstadoRegFactu {
+    /// The typed backend error code reported for this record, if any.
+    pub fn backend_error(&self) -> Option<crate::errors::BackendError> {
+        self.codigo_error_registro
+            .map(|code| crate::errors::BackendError::from_code(code as u32))
+    }
 }
 
 // Wrapper for the rectified-invoice list in a consulta response
@@ -2806,6 +2830,16 @@ impl SoapFault {
         self.faultstring
             .strip_prefix("Codigo[")
             .and_then(|rest| rest.split(']').next())
+    }
+
+    /// The typed backend error code for this fault, when AEAT included a
+    /// recognizable `Codigo[NNNN]` prefix in the fault string. This lets
+    /// callers match on a specific [`crate::errors::BackendError`] rather than
+    /// parsing the human-readable fault string.
+    pub fn backend_error(&self) -> Option<crate::errors::BackendError> {
+        self.codigo()
+            .and_then(|codigo| codigo.parse::<u32>().ok())
+            .map(crate::errors::BackendError::from_code)
     }
 }
 
