@@ -827,8 +827,15 @@ pub struct Cabecera {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemisionVoluntaria {
-    #[serde(rename = "sum1:FechaFinVeriFactu", alias = "FechaFinVeriFactu")]
-    pub fecha_fin_veri_factu: Fecha,
+    // Both children are minOccurs="0" in the AEAT XSD. FechaFinVeriFactu is only
+    // populated on the final submission, when the taxpayer ceases VeriFactu use;
+    // for ordinary continuous submission it is omitted and only Incidencia is set.
+    #[serde(
+        rename = "sum1:FechaFinVeriFactu",
+        alias = "FechaFinVeriFactu",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fecha_fin_veri_factu: Option<Fecha>,
     #[serde(rename = "sum1:Incidencia", alias = "Incidencia")]
     pub incidencia: Incidencia,
 }
