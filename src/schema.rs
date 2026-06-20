@@ -3141,3 +3141,357 @@ mod registro_alta_validation_tests {
         assert!(alta.validate().is_ok());
     }
 }
+
+#[cfg(test)]
+mod edge_case_tests {
+    use super::*;
+    use crate::hashing::{AnulacionHuellaInput, Hashable};
+
+    // ---- builders -------------------------------------------------------
+
+    fn sistema_informatico() -> SistemaInformatico {
+        SistemaInformatico {
+            nombre_razon: "Productor SL".try_into().unwrap(),
+            nif: "B75929299".try_into().unwrap(),
+            nombre_sistema_informatico: "uninvoice".try_into().unwrap(),
+            id_sistema_informatico: "01".try_into().unwrap(),
+            version: "1.0".try_into().unwrap(),
+            numero_instalacion: "1".try_into().unwrap(),
+            tipo_uso_posible_solo_verifactu: SiNo::S,
+            tipo_uso_posible_multi_ot: SiNo::N,
+            indicador_multiples_ot: SiNo::N,
+        }
+    }
+
+    fn id_factura() -> IDFactura {
+        IDFactura {
+            id_emisor_factura: "B12345678".try_into().unwrap(),
+            num_serie_factura: "2025-1".try_into().unwrap(),
+            fecha_expedicion_factura: "15-03-2025".try_into().unwrap(),
+        }
+    }
+
+    /// A standard `F1` Alta. Corrective tests mutate `tipo_factura` and the
+    /// rectification fields.
+    fn alta_record() -> RegistroFacturacionAlta {
+        let detalle = Detalle {
+            base_imponible_o_importe_no_sujeto: "100.00".try_into().unwrap(),
+            ..Default::default()
+        };
+        RegistroFacturacionAlta {
+            id_version: "1.0".try_into().unwrap(),
+            id_factura: id_factura(),
+            ref_externa: None,
+            nombre_razon_emisor: "Emisor SL".try_into().unwrap(),
+            subsanacion: None,
+            rechazo_previo: None,
+            tipo_factura: TipoFactura::F1,
+            tipo_rectificativa: None,
+            facturas_rectificadas: None,
+            facturas_sustituidas: None,
+            importe_rectificacion: None,
+            fecha_operacion: None,
+            descripcion_operacion: "Servicios".try_into().unwrap(),
+            factura_simplificada_art7273: None,
+            factura_sin_identif_destinatario_art61d: None,
+            macrodato: None,
+            emitida_por_tercero_o_destinatario: None,
+            tercero: None,
+            destinatarios: None,
+            cupon: None,
+            desglose: Desglose::new(vec![detalle]).unwrap(),
+            cuota_total: "21.00".try_into().unwrap(),
+            importe_total: "121.00".try_into().unwrap(),
+            encadenamiento: Encadenamiento::PrimerRegistro,
+            sistema_informatico: sistema_informatico(),
+            fecha_hora_huso_gen_registro: "2025-03-15T10:00:00+01:00".to_string(),
+            num_registro_acuerdo_facturacion: None,
+            id_acuerdo_sistema_informatico: None,
+            tipo_huella: TipoHuella::Sha256,
+            huella: "".try_into().unwrap(),
+        }
+    }
+
+    fn anulacion_record() -> RegistroFacturacionAnulacion {
+        RegistroFacturacionAnulacion {
+            id_version: "1.0".try_into().unwrap(),
+            id_factura: IDFacturaAnulada {
+                id_emisor_factura_anulada: "B12345678".try_into().unwrap(),
+                num_serie_factura_anulada: "2025-1".try_into().unwrap(),
+                fecha_expedicion_factura_anulada: "15-03-2025".try_into().unwrap(),
+            },
+            ref_externa: None,
+            sin_registro_previo: None,
+            rechazo_previo: None,
+            generado_por: None,
+            generador: None,
+            encadenamiento: Encadenamiento::PrimerRegistro,
+            sistema_informatico: sistema_informatico(),
+            fecha_hora_huso_gen_registro: "2025-03-15T11:00:00+01:00".to_string(),
+            tipo_huella: TipoHuella::Sha256,
+            huella: "".try_into().unwrap(),
+        }
+    }
+
+    fn cabecera() -> Cabecera {
+        Cabecera {
+            obligado_emision: PersonaFisicaJuridicaES {
+                nombre_razon: "Emisor SL".try_into().unwrap(),
+                identificador: Identificador::Nif("B12345678".try_into().unwrap()),
+            },
+            representante: None,
+            remision_voluntaria: Some(RemisionVoluntaria {
+                fecha_fin_veri_factu: None,
+                incidencia: Incidencia::N,
+            }),
+            remision_requerimiento: None,
+        }
+    }
+
+    fn corrective_alta(tipo: TipoFactura) -> RegistroFacturacionAlta {
+        RegistroFacturacionAlta {
+            tipo_factura: tipo,
+            tipo_rectificativa: Some(TipoRectificativa::I),
+            facturas_rectificadas: Some(vec![id_factura()]),
+            ..alta_record()
+        }
+    }
+
+    // ---- corrective invoice (R1-R5) serialization -----------------------
+
+    #[test]
+    fn corrective_types_serialize_their_code() {
+        for tipo in [
+            TipoFactura::R1,
+            TipoFactura::R2,
+            TipoFactura::R3,
+            TipoFactura::R4,
+            TipoFactura::R5,
+        ] {
+            let alta = corrective_alta(tipo.clone());
+            let xml = quick_xml::se::to_string(&alta).expect("valid xml");
+            assert!(
+                xml.contains(&format!("<sum1:TipoFactura>{tipo}</sum1:TipoFactura>")),
+                "missing TipoFactura {tipo} in {xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_corrective_serializes_rectified_references() {
+        let alta = corrective_alta(TipoFactura::R1);
+        let xml = quick_xml::se::to_string(&alta).expect("valid xml");
+        assert!(
+            xml.contains("<sum1:TipoRectificativa>I</sum1:TipoRectificativa>"),
+            "{xml}"
+        );
+        // The references are nested in the <IDFacturaRectificada> wrapper AEAT
+        // requires (error 4102 otherwise).
+        assert!(
+            xml.contains("<sum1:FacturasRectificadas><sum1:IDFacturaRectificada>"),
+            "{xml}"
+        );
+        // Incremental corrections must not restate the rectified amounts.
+        assert!(!xml.contains("ImporteRectificacion"), "{xml}");
+    }
+
+    #[test]
+    fn substitutive_corrective_serializes_importe_rectificacion() {
+        let alta = RegistroFacturacionAlta {
+            tipo_rectificativa: Some(TipoRectificativa::S),
+            importe_rectificacion: Some(ImporteRectificacion {
+                base_rectificada: "100.00".try_into().unwrap(),
+                cuota_rectificada: "21.00".try_into().unwrap(),
+                cuota_recargo_rectificado: None,
+            }),
+            ..corrective_alta(TipoFactura::R1)
+        };
+        let xml = quick_xml::se::to_string(&alta).expect("valid xml");
+        assert!(
+            xml.contains("<sum1:TipoRectificativa>S</sum1:TipoRectificativa>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                "<sum1:ImporteRectificacion><sum1:BaseRectificada>100.00</sum1:BaseRectificada>"
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<sum1:CuotaRectificada>21.00</sum1:CuotaRectificada>"),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn corrective_alta_round_trips_through_xml() {
+        let alta = corrective_alta(TipoFactura::R3);
+        let xml = quick_xml::se::to_string(&alta).expect("serialize");
+        let parsed: RegistroFacturacionAlta = quick_xml::de::from_str(&xml).expect("deserialize");
+        assert!(matches!(parsed.tipo_factura, TipoFactura::R3));
+        assert!(matches!(
+            parsed.tipo_rectificativa,
+            Some(TipoRectificativa::I)
+        ));
+        assert_eq!(parsed.facturas_rectificadas.as_ref().map(Vec::len), Some(1));
+    }
+
+    // ---- mixed Alta/Anulacion batch -------------------------------------
+
+    #[test]
+    fn mixed_batch_serializes_both_record_types() {
+        let suministro = SuministroInformacion::new(
+            cabecera(),
+            vec![
+                RegistroFactura::Alta(alta_record()),
+                RegistroFactura::Anulacion(anulacion_record()),
+            ],
+        )
+        .expect("valid suministro");
+        assert_eq!(suministro.registro_factura.len(), 2);
+
+        let xml = quick_xml::se::to_string(&suministro).expect("valid xml");
+        assert!(xml.contains("<sum1:RegistroAlta>"), "{xml}");
+        assert!(xml.contains("<sum1:RegistroAnulacion>"), "{xml}");
+    }
+
+    #[test]
+    fn batch_rejects_empty_record_list() {
+        let err = SuministroInformacion::new(cabecera(), vec![]).unwrap_err();
+        assert!(err.to_string().contains("at least one registro_factura"));
+    }
+
+    #[test]
+    fn mixed_batch_round_trips_through_xml() {
+        let suministro = SuministroInformacion::new(
+            cabecera(),
+            vec![
+                RegistroFactura::Alta(alta_record()),
+                RegistroFactura::Anulacion(anulacion_record()),
+            ],
+        )
+        .unwrap();
+        let xml = quick_xml::se::to_string(&suministro).expect("serialize");
+        let parsed: SuministroInformacion = quick_xml::de::from_str(&xml).expect("deserialize");
+        assert_eq!(parsed.registro_factura.len(), 2);
+        assert!(matches!(
+            parsed.registro_factura[0],
+            RegistroFactura::Alta(_)
+        ));
+        assert!(matches!(
+            parsed.registro_factura[1],
+            RegistroFactura::Anulacion(_)
+        ));
+    }
+
+    // ---- Anulacion huella vectors ---------------------------------------
+    //
+    // AEAT publishes a single fully worked huella example (an Alta record, see
+    // `hashing::tests::alta_first_record_matches_aeat_example`). The Anulacion
+    // concatenation format is documented but not given as a worked example, so
+    // these vectors are pinned from the documented `IDEmisorFacturaAnulada=...`
+    // layout and guard the full-struct `Hashable` wiring against drift.
+
+    #[test]
+    fn anulacion_struct_hash_matches_documented_layout() {
+        let registro = anulacion_record();
+        let expected = AnulacionHuellaInput {
+            id_emisor_factura_anulada: "B12345678",
+            num_serie_factura_anulada: "2025-1",
+            fecha_expedicion_factura_anulada: "15-03-2025",
+            prev_huella: None,
+            fecha_hora_huso_gen_registro: "2025-03-15T11:00:00+01:00",
+        }
+        .huella();
+        assert_eq!(registro.hash(None), expected);
+    }
+
+    #[test]
+    fn anulacion_struct_hash_known_vector() {
+        // Same inputs as `hashing::tests::anulacion_first_record_format`, asserted
+        // here through the full `RegistroFacturacionAnulacion` struct.
+        let registro = RegistroFacturacionAnulacion {
+            id_factura: IDFacturaAnulada {
+                id_emisor_factura_anulada: "89890001K".try_into().unwrap(),
+                num_serie_factura_anulada: "12345678/G33".try_into().unwrap(),
+                fecha_expedicion_factura_anulada: "01-01-2024".try_into().unwrap(),
+            },
+            fecha_hora_huso_gen_registro: "2024-01-03T19:20:30+01:00".to_string(),
+            ..anulacion_record()
+        };
+        assert_eq!(
+            registro.hash(None),
+            "9AC16B332D14EDC61801758056AD892CB25005778B412E2064365655A48B7B2A"
+        );
+    }
+
+    #[test]
+    fn anulacion_struct_hash_chains_prev_huella() {
+        let registro = anulacion_record();
+        let prev = "9AC16B332D14EDC61801758056AD892CB25005778B412E2064365655A48B7B2A";
+        let chained = registro.hash(Some(prev));
+        assert_ne!(chained, registro.hash(None));
+        let expected = AnulacionHuellaInput {
+            id_emisor_factura_anulada: "B12345678",
+            num_serie_factura_anulada: "2025-1",
+            fecha_expedicion_factura_anulada: "15-03-2025",
+            prev_huella: Some(prev),
+            fecha_hora_huso_gen_registro: "2025-03-15T11:00:00+01:00",
+        }
+        .huella();
+        assert_eq!(chained, expected);
+    }
+
+    // ---- negative ImporteSgn amounts ------------------------------------
+
+    #[test]
+    fn negative_importe_sgn12_2_is_accepted() {
+        for value in ["-50.00", "-100", "-0.50", "-1234567890.99"] {
+            let importe = ImporteSgn12_2::try_from(value)
+                .unwrap_or_else(|err| panic!("{value} should be valid: {err}"));
+            assert_eq!(importe.as_ref(), value);
+        }
+    }
+
+    #[test]
+    fn negative_importe_sgn14_2_is_accepted() {
+        let importe = ImporteSgn14_2::try_from("-12345678901234.56").expect("valid");
+        assert_eq!(importe.as_ref(), "-12345678901234.56");
+    }
+
+    #[test]
+    fn sign_without_digits_is_rejected() {
+        assert!(ImporteSgn12_2::try_from("-").is_err());
+    }
+
+    #[test]
+    fn negative_amounts_serialize_with_their_sign() {
+        // A credit-note style detalle carrying negative base and quota.
+        let detalle = Detalle {
+            base_imponible_o_importe_no_sujeto: "-100.00".try_into().unwrap(),
+            cuota_repercutida: Some("-21.00".try_into().unwrap()),
+            ..Default::default()
+        };
+        let alta = RegistroFacturacionAlta {
+            desglose: Desglose::new(vec![detalle]).unwrap(),
+            cuota_total: "-21.00".try_into().unwrap(),
+            importe_total: "-121.00".try_into().unwrap(),
+            ..alta_record()
+        };
+        let xml = quick_xml::se::to_string(&alta).expect("valid xml");
+        assert!(
+            xml.contains(
+                "<sum1:BaseImponibleOimporteNoSujeto>-100.00</sum1:BaseImponibleOimporteNoSujeto>"
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<sum1:CuotaTotal>-21.00</sum1:CuotaTotal>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<sum1:ImporteTotal>-121.00</sum1:ImporteTotal>"),
+            "{xml}"
+        );
+    }
+}
