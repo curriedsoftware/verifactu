@@ -29,7 +29,7 @@ use std::{
     io::{self, Write},
 };
 
-use clap::{Args, Parser, Subcommand, command};
+use clap::{Args, Parser, Subcommand};
 use const_oid::ObjectIdentifier;
 use pkcs8::{EncryptedPrivateKeyInfo, der::Decode};
 use prettytable::{Table, format, row};
@@ -38,9 +38,11 @@ use reqwest::{Client, Identity};
 use verifactu::{
     self, Environment,
     errors::DataError,
+    hashing::{AltaHuellaInput, AnulacionHuellaInput},
     schema::{
-        Identificador, PeriodoImputacion as SchemaPeriodoImputacion, PersonaFisicaJuridicaConsulta,
-        RespuestaConsultaLR, SiNo,
+        Encadenamiento, EstadoRegistroConsulta, Identificador, IndicadorPaginacion,
+        PeriodoImputacion as SchemaPeriodoImputacion, PersonaFisicaJuridicaConsulta,
+        RegistroRespuestaConsultaRegFacturacion, RespuestaConsultaLR, ResultadoConsulta, SiNo,
     },
 };
 use x509_cert::{Certificate, der::DecodePem};
@@ -132,6 +134,17 @@ enum Command {
         #[arg(long)]
         xml: bool,
     },
+    /// Verify the integrity of a registered hash chain by recomputing every
+    /// record's huella from the data AEAT returns for a period (`consulta`), and
+    /// checking it against the huella AEAT stored. Exits non-zero on any
+    /// mismatch.
+    VerifyChain {
+        #[command(flatten)]
+        filtro: FiltroConsulta,
+        /// NIF del obligado a emisión. If omitted, it's derived from the user certificate.
+        #[arg(long)]
+        obligado_emision: Option<String>,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -191,9 +204,294 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_consulta_table(&result);
             }
         }
+        Command::VerifyChain {
+            filtro,
+            obligado_emision,
+        } => {
+            let client = build_verifactu_client(environment)?;
+            let obligado_emision = build_obligado_emision(obligado_emision)?;
+            let registros = fetch_all_registros(&client, obligado_emision, filtro).await?;
+            let checks = verify_chain(&registros);
+            print_chain_report(&checks);
+            let failures = checks.iter().filter(|c| c.outcome.is_failure()).count();
+            if failures > 0 {
+                return Err(
+                    format!("chain integrity check failed: {failures} bad record(s)").into(),
+                );
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Query the AEAT `consulta` endpoint for a period, following pagination until
+/// every registro has been collected.
+async fn fetch_all_registros(
+    client: &verifactu::Client,
+    obligado_emision: PersonaFisicaJuridicaConsulta,
+    filtro: FiltroConsulta,
+) -> Result<Vec<RegistroRespuestaConsultaRegFacturacion>, Box<dyn Error>> {
+    let base_filtro: verifactu::schema::FiltroConsulta = filtro.try_into()?;
+
+    let mut registros = Vec::new();
+    let mut clave_paginacion = None;
+
+    loop {
+        let mut filtro_consulta = base_filtro.clone();
+        filtro_consulta.clave_paginacion = clave_paginacion.clone();
+
+        let result = client
+            .consulta(&verifactu::schema::ConsultaFactuSistemaFacturacion {
+                cabecera: verifactu::schema::CabeceraConsulta {
+                    id_version: "1.0".try_into()?,
+                    obligado_emision: Some(obligado_emision.clone()),
+                    destinatario: None,
+                    indicador_representante: None,
+                },
+                filtro_consulta,
+                datos_adicionales_respuesta: None,
+            })
+            .await?;
+
+        if matches!(result.resultado_consulta, ResultadoConsulta::SinDatos) {
+            break;
+        }
+
+        registros.extend(result.registros);
+
+        match result.indicador_paginacion {
+            IndicadorPaginacion::S => {
+                clave_paginacion = result.clave_paginacion;
+                // Defensive: AEAT signalled more pages but gave no cursor. Stop
+                // rather than loop forever on the same page.
+                if clave_paginacion.is_none() {
+                    break;
+                }
+            }
+            IndicadorPaginacion::N => break,
+        }
+    }
+
+    Ok(registros)
+}
+
+/// Outcome of recomputing one record's huella.
+enum CheckOutcome {
+    /// The recomputed huella matches the one AEAT stored.
+    Ok,
+    /// Recomputed huella differs from the stored one (tampered or corrupt).
+    Mismatch { stored: String, recomputed: String },
+    /// A field required to recompute the huella was absent from the response.
+    Missing(&'static str),
+}
+
+impl CheckOutcome {
+    fn is_failure(&self) -> bool {
+        !matches!(self, CheckOutcome::Ok)
+    }
+}
+
+/// How a record links into the chain, derived from its `Encadenamiento`.
+enum LinkStatus {
+    /// First record of the chain (`PrimerRegistro`).
+    First,
+    /// Chains onto a record whose huella is present in the queried set.
+    LinkedInSet,
+    /// Chains onto a huella not in the queried set (e.g. a prior period).
+    LinkedOutsideSet,
+    /// No `Encadenamiento` element at all -- anomalous; AEAT always sets one.
+    MissingEncadenamiento,
+}
+
+/// The verification result for a single record.
+struct RecordCheck {
+    index: usize,
+    kind: &'static str,
+    num_serie: String,
+    fecha: String,
+    outcome: CheckOutcome,
+    link: LinkStatus,
+}
+
+/// Recompute and verify the huella of every record AEAT returned.
+///
+/// Each record carries the previous record's huella inside its own
+/// `Encadenamiento::RegistroAnterior`, so the per-record check is self-contained:
+/// recompute the huella from the record's fields plus that embedded predecessor
+/// huella and compare against the huella AEAT stored. Any tampering with a
+/// record's content *or* with the predecessor huella it claims breaks the match.
+fn verify_chain(registros: &[RegistroRespuestaConsultaRegFacturacion]) -> Vec<RecordCheck> {
+    // Index records by their stored huella so we can classify each link as
+    // pointing inside or outside the queried set.
+    let huellas: std::collections::HashSet<&str> = registros
+        .iter()
+        .filter_map(|r| r.datos_registro_facturacion.huella.as_ref())
+        .map(|h| h.as_str())
+        .collect();
+
+    registros
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let datos = &record.datos_registro_facturacion;
+            let is_anulacion = matches!(
+                record.estado_registro.estado_registro,
+                EstadoRegistroConsulta::Anulado
+            );
+
+            let prev_huella: Option<&str> = match &datos.encadenamiento {
+                Some(Encadenamiento::RegistroAnterior(prev)) => Some(prev.huella.as_str()),
+                Some(Encadenamiento::PrimerRegistro) | None => None,
+            };
+
+            let link = match &datos.encadenamiento {
+                Some(Encadenamiento::PrimerRegistro) => LinkStatus::First,
+                Some(Encadenamiento::RegistroAnterior(prev)) => {
+                    if huellas.contains(prev.huella.as_str()) {
+                        LinkStatus::LinkedInSet
+                    } else {
+                        LinkStatus::LinkedOutsideSet
+                    }
+                }
+                None => LinkStatus::MissingEncadenamiento,
+            };
+
+            let outcome = recompute_outcome(record, is_anulacion, prev_huella);
+
+            RecordCheck {
+                index,
+                kind: if is_anulacion { "anulacion" } else { "alta" },
+                num_serie: record.id_factura.num_serie_factura.to_string(),
+                fecha: record.id_factura.fecha_expedicion_factura.to_string(),
+                outcome,
+                link,
+            }
+        })
+        .collect()
+}
+
+/// Recompute a single record's huella and compare it to the stored value.
+fn recompute_outcome(
+    record: &RegistroRespuestaConsultaRegFacturacion,
+    is_anulacion: bool,
+    prev_huella: Option<&str>,
+) -> CheckOutcome {
+    let datos = &record.datos_registro_facturacion;
+
+    let Some(stored) = datos.huella.as_ref().map(|h| h.as_str()) else {
+        return CheckOutcome::Missing("Huella");
+    };
+    let Some(fecha_hora) = datos.fecha_hora_huso_gen_registro.as_deref() else {
+        return CheckOutcome::Missing("FechaHoraHusoGenRegistro");
+    };
+
+    let id_emisor = record.id_factura.id_emisor_factura.to_string();
+    let num_serie = record.id_factura.num_serie_factura.to_string();
+    let fecha = record.id_factura.fecha_expedicion_factura.to_string();
+
+    let recomputed = if is_anulacion {
+        AnulacionHuellaInput {
+            id_emisor_factura_anulada: &id_emisor,
+            num_serie_factura_anulada: &num_serie,
+            fecha_expedicion_factura_anulada: &fecha,
+            prev_huella,
+            fecha_hora_huso_gen_registro: fecha_hora,
+        }
+        .huella()
+    } else {
+        let Some(tipo_factura) = datos.tipo_factura.as_ref() else {
+            return CheckOutcome::Missing("TipoFactura");
+        };
+        let Some(cuota_total) = datos.cuota_total.as_ref() else {
+            return CheckOutcome::Missing("CuotaTotal");
+        };
+        let Some(importe_total) = datos.importe_total.as_ref() else {
+            return CheckOutcome::Missing("ImporteTotal");
+        };
+        AltaHuellaInput {
+            id_emisor_factura: &id_emisor,
+            num_serie_factura: &num_serie,
+            fecha_expedicion_factura: &fecha,
+            tipo_factura: &tipo_factura.to_string(),
+            cuota_total: cuota_total.as_ref(),
+            importe_total: importe_total.as_ref(),
+            prev_huella,
+            fecha_hora_huso_gen_registro: fecha_hora,
+        }
+        .huella()
+    };
+
+    if recomputed == stored {
+        CheckOutcome::Ok
+    } else {
+        CheckOutcome::Mismatch {
+            stored: stored.to_owned(),
+            recomputed,
+        }
+    }
+}
+
+/// Print the per-record verification results and a final summary.
+fn print_chain_report(checks: &[RecordCheck]) {
+    if checks.is_empty() {
+        println!("No registros returned for the requested period; nothing to verify.");
+        return;
+    }
+
+    println!(
+        "\n=== Verifying Verifactu hash chain ({} record(s)) ===\n",
+        checks.len()
+    );
+
+    for check in checks {
+        let link = match check.link {
+            LinkStatus::First => "primer registro",
+            LinkStatus::LinkedInSet => "← prev in set",
+            LinkStatus::LinkedOutsideSet => "← prev outside set",
+            LinkStatus::MissingEncadenamiento => "⚠ no encadenamiento",
+        };
+        match &check.outcome {
+            CheckOutcome::Ok => {
+                println!(
+                    "  ✓ [{}] {} {} ({}) [{link}] huella OK",
+                    check.index + 1,
+                    check.kind,
+                    check.num_serie,
+                    check.fecha,
+                );
+            }
+            CheckOutcome::Mismatch { stored, recomputed } => {
+                println!(
+                    "  ✗ [{}] {} {} ({}) [{link}] HUELLA MISMATCH\n      stored:     {stored}\n      recomputed: {recomputed}",
+                    check.index + 1,
+                    check.kind,
+                    check.num_serie,
+                    check.fecha,
+                );
+            }
+            CheckOutcome::Missing(field) => {
+                println!(
+                    "  ✗ [{}] {} {} ({}) [{link}] cannot recompute: missing {field}",
+                    check.index + 1,
+                    check.kind,
+                    check.num_serie,
+                    check.fecha,
+                );
+            }
+        }
+    }
+
+    let failures = checks.iter().filter(|c| c.outcome.is_failure()).count();
+    println!();
+    if failures == 0 {
+        println!(
+            "✓ Chain integrity verified: all {} huellas match.",
+            checks.len()
+        );
+    } else {
+        println!("✗ Chain integrity check found {failures} bad record(s).");
+    }
 }
 
 /// Render a `consulta` response as a human-readable table using `prettytable`.
