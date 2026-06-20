@@ -1586,6 +1586,18 @@ pub enum TipoFactura {
     F3, // Replacement for simplified invoices
 }
 
+impl TipoFactura {
+    /// Whether this is a corrective (rectificativa) invoice type, i.e. one of
+    /// R1-R5. Corrective invoices carry the `TipoRectificativa` and
+    /// `FacturasRectificadas` fields.
+    pub fn is_corrective(&self) -> bool {
+        matches!(
+            self,
+            TipoFactura::R1 | TipoFactura::R2 | TipoFactura::R3 | TipoFactura::R4 | TipoFactura::R5
+        )
+    }
+}
+
 impl std::fmt::Display for TipoFactura {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2279,6 +2291,77 @@ impl RegistroFacturacionAlta {
             }
         }
 
+        // Cross-field constraints between TipoFactura, TipoRectificativa and the
+        // corrective/replacement reference blocks (AEAT XSD + business rules).
+        let is_corrective = self.tipo_factura.is_corrective();
+
+        // R1-R5 are rectificativas: they must declare how they rectify
+        // (TipoRectificativa) and which invoices they rectify
+        // (FacturasRectificadas).
+        if is_corrective {
+            if self.tipo_rectificativa.is_none() {
+                return Err(ValidationError::new(
+                    "RegistroFacturacionAlta",
+                    format!(
+                        "TipoRectificativa is required when TipoFactura is {} (R1-R5)",
+                        self.tipo_factura
+                    ),
+                ));
+            }
+            if self.facturas_rectificadas.is_none() {
+                return Err(ValidationError::new(
+                    "RegistroFacturacionAlta",
+                    format!(
+                        "FacturasRectificadas is required when TipoFactura is {} (R1-R5)",
+                        self.tipo_factura
+                    ),
+                ));
+            }
+        }
+
+        // TipoRectificativa governs whether the rectified amounts are restated.
+        // Substitutive (S) replaces the original, so it must carry
+        // ImporteRectificacion; incremental (I) reports only the delta and must
+        // not.
+        match self.tipo_rectificativa {
+            Some(TipoRectificativa::S) if self.importe_rectificacion.is_none() => {
+                return Err(ValidationError::new(
+                    "RegistroFacturacionAlta",
+                    "ImporteRectificacion is required when TipoRectificativa is S (substitutive)",
+                ));
+            }
+            Some(TipoRectificativa::I) if self.importe_rectificacion.is_some() => {
+                return Err(ValidationError::new(
+                    "RegistroFacturacionAlta",
+                    "ImporteRectificacion must not be set when TipoRectificativa is I (incremental)",
+                ));
+            }
+            _ => {}
+        }
+
+        // F3 replaces previously issued simplified invoices, so it must list the
+        // invoices it substitutes.
+        if matches!(self.tipo_factura, TipoFactura::F3) && self.facturas_sustituidas.is_none() {
+            return Err(ValidationError::new(
+                "RegistroFacturacionAlta",
+                "FacturasSustituidas is required when TipoFactura is F3",
+            ));
+        }
+
+        // Within each Desglose detalle, an operation is either qualified
+        // (CalificacionOperacion) or exempt (OperacionExenta) — never both.
+        for (index, detalle) in self.desglose.detalle_desglose.iter().enumerate() {
+            if detalle.calificacion_operacion.is_some() && detalle.operacion_exenta.is_some() {
+                return Err(ValidationError::new(
+                    "RegistroFacturacionAlta",
+                    format!(
+                        "CalificacionOperacion and OperacionExenta are mutually exclusive \
+                         (both set in Desglose detalle {index})"
+                    ),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -2853,5 +2936,208 @@ impl SoapFault {
 impl std::fmt::Display for SoapFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.faultstring, self.faultcode)
+    }
+}
+
+#[cfg(test)]
+mod registro_alta_validation_tests {
+    use super::*;
+
+    fn sample_sistema_informatico() -> SistemaInformatico {
+        SistemaInformatico {
+            nombre_razon: "Productor SL".try_into().unwrap(),
+            nif: "B75929299".try_into().unwrap(),
+            nombre_sistema_informatico: "uninvoice".try_into().unwrap(),
+            id_sistema_informatico: "01".try_into().unwrap(),
+            version: "1.0".try_into().unwrap(),
+            numero_instalacion: "1".try_into().unwrap(),
+            tipo_uso_posible_solo_verifactu: SiNo::S,
+            tipo_uso_posible_multi_ot: SiNo::N,
+            indicador_multiples_ot: SiNo::N,
+        }
+    }
+
+    fn sample_id_factura() -> IDFactura {
+        IDFactura {
+            id_emisor_factura: "B12345678".try_into().unwrap(),
+            num_serie_factura: "2025-1".try_into().unwrap(),
+            fecha_expedicion_factura: "15-03-2025".try_into().unwrap(),
+        }
+    }
+
+    fn importe_rectificacion() -> ImporteRectificacion {
+        ImporteRectificacion {
+            base_rectificada: "100.00".try_into().unwrap(),
+            cuota_rectificada: "21.00".try_into().unwrap(),
+            cuota_recargo_rectificado: None,
+        }
+    }
+
+    /// A minimal, valid `F1` standard invoice record. Tests mutate single fields
+    /// to exercise one cross-field rule at a time.
+    fn valid_f1_alta() -> RegistroFacturacionAlta {
+        let detalle = Detalle {
+            base_imponible_o_importe_no_sujeto: "100.00".try_into().unwrap(),
+            ..Default::default()
+        };
+        RegistroFacturacionAlta {
+            id_version: "1.0".try_into().unwrap(),
+            id_factura: sample_id_factura(),
+            ref_externa: None,
+            nombre_razon_emisor: "Emisor SL".try_into().unwrap(),
+            subsanacion: None,
+            rechazo_previo: None,
+            tipo_factura: TipoFactura::F1,
+            tipo_rectificativa: None,
+            facturas_rectificadas: None,
+            facturas_sustituidas: None,
+            importe_rectificacion: None,
+            fecha_operacion: None,
+            descripcion_operacion: "Servicios".try_into().unwrap(),
+            factura_simplificada_art7273: None,
+            factura_sin_identif_destinatario_art61d: None,
+            macrodato: None,
+            emitida_por_tercero_o_destinatario: None,
+            tercero: None,
+            destinatarios: None,
+            cupon: None,
+            desglose: Desglose::new(vec![detalle]).unwrap(),
+            cuota_total: "21.00".try_into().unwrap(),
+            importe_total: "121.00".try_into().unwrap(),
+            encadenamiento: Encadenamiento::PrimerRegistro,
+            sistema_informatico: sample_sistema_informatico(),
+            fecha_hora_huso_gen_registro: "2025-03-15T10:00:00+01:00".to_string(),
+            num_registro_acuerdo_facturacion: None,
+            id_acuerdo_sistema_informatico: None,
+            tipo_huella: TipoHuella::Sha256,
+            huella: "".try_into().unwrap(),
+        }
+    }
+
+    /// A valid R1 corrective record: declares both how and what it rectifies.
+    fn valid_r1_alta() -> RegistroFacturacionAlta {
+        RegistroFacturacionAlta {
+            tipo_factura: TipoFactura::R1,
+            tipo_rectificativa: Some(TipoRectificativa::I),
+            facturas_rectificadas: Some(vec![sample_id_factura()]),
+            ..valid_f1_alta()
+        }
+    }
+
+    #[test]
+    fn f1_minimal_record_is_valid() {
+        assert!(valid_f1_alta().validate().is_ok());
+    }
+
+    #[test]
+    fn r1_minimal_record_is_valid() {
+        assert!(valid_r1_alta().validate().is_ok());
+    }
+
+    #[test]
+    fn corrective_requires_tipo_rectificativa() {
+        let alta = RegistroFacturacionAlta {
+            tipo_rectificativa: None,
+            ..valid_r1_alta()
+        };
+        let err = alta.validate().unwrap_err();
+        assert!(err.to_string().contains("TipoRectificativa is required"));
+    }
+
+    #[test]
+    fn corrective_requires_facturas_rectificadas() {
+        let alta = RegistroFacturacionAlta {
+            facturas_rectificadas: None,
+            ..valid_r1_alta()
+        };
+        let err = alta.validate().unwrap_err();
+        assert!(err.to_string().contains("FacturasRectificadas is required"));
+    }
+
+    #[test]
+    fn substitutive_requires_importe_rectificacion() {
+        let alta = RegistroFacturacionAlta {
+            tipo_rectificativa: Some(TipoRectificativa::S),
+            importe_rectificacion: None,
+            ..valid_r1_alta()
+        };
+        let err = alta.validate().unwrap_err();
+        assert!(err.to_string().contains("ImporteRectificacion is required"));
+    }
+
+    #[test]
+    fn substitutive_with_importe_rectificacion_is_valid() {
+        let alta = RegistroFacturacionAlta {
+            tipo_rectificativa: Some(TipoRectificativa::S),
+            importe_rectificacion: Some(importe_rectificacion()),
+            ..valid_r1_alta()
+        };
+        assert!(alta.validate().is_ok());
+    }
+
+    #[test]
+    fn incremental_must_not_set_importe_rectificacion() {
+        let alta = RegistroFacturacionAlta {
+            tipo_rectificativa: Some(TipoRectificativa::I),
+            importe_rectificacion: Some(importe_rectificacion()),
+            ..valid_r1_alta()
+        };
+        let err = alta.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ImporteRectificacion must not be set")
+        );
+    }
+
+    #[test]
+    fn f3_requires_facturas_sustituidas() {
+        let alta = RegistroFacturacionAlta {
+            tipo_factura: TipoFactura::F3,
+            facturas_sustituidas: None,
+            destinatarios: None,
+            ..valid_f1_alta()
+        };
+        let err = alta.validate().unwrap_err();
+        assert!(err.to_string().contains("FacturasSustituidas is required"));
+    }
+
+    #[test]
+    fn f3_with_facturas_sustituidas_is_valid() {
+        let alta = RegistroFacturacionAlta {
+            tipo_factura: TipoFactura::F3,
+            facturas_sustituidas: Some(vec![sample_id_factura()]),
+            ..valid_f1_alta()
+        };
+        assert!(alta.validate().is_ok());
+    }
+
+    #[test]
+    fn calificacion_and_exenta_are_mutually_exclusive() {
+        let detalle = Detalle {
+            base_imponible_o_importe_no_sujeto: "100.00".try_into().unwrap(),
+            calificacion_operacion: Some(CalificacionOperacion::S1),
+            operacion_exenta: Some(OperacionExenta::E1),
+            ..Default::default()
+        };
+        let alta = RegistroFacturacionAlta {
+            desglose: Desglose::new(vec![detalle]).unwrap(),
+            ..valid_f1_alta()
+        };
+        let err = alta.validate().unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn detalle_with_only_calificacion_is_valid() {
+        let detalle = Detalle {
+            base_imponible_o_importe_no_sujeto: "100.00".try_into().unwrap(),
+            calificacion_operacion: Some(CalificacionOperacion::S1),
+            ..Default::default()
+        };
+        let alta = RegistroFacturacionAlta {
+            desglose: Desglose::new(vec![detalle]).unwrap(),
+            ..valid_f1_alta()
+        };
+        assert!(alta.validate().is_ok());
     }
 }
