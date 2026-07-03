@@ -127,9 +127,6 @@ enum Command {
     Consulta {
         #[command(flatten)]
         filtro: FiltroConsulta,
-        /// NIF del obligado a emisión. If omitted, it's derived from the user certificate.
-        #[arg(long)]
-        obligado_emision: Option<String>,
         /// Show result in XML format.
         #[arg(long)]
         xml: bool,
@@ -141,9 +138,6 @@ enum Command {
     VerifyChain {
         #[command(flatten)]
         filtro: FiltroConsulta,
-        /// NIF del obligado a emisión. If omitted, it's derived from the user certificate.
-        #[arg(long)]
-        obligado_emision: Option<String>,
     },
 }
 
@@ -160,6 +154,11 @@ struct Cli {
     /// Intended for non-interactive/automated use; use with care.
     #[arg(long, global = true)]
     yes: bool,
+    /// NIF del obligado a emisión. If omitted, it's derived from the user
+    /// certificate. Applies to every command that needs an ObligadoEmision
+    /// identity (consulta, verify-chain, ...).
+    #[arg(long, global = true)]
+    obligado_emision: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -178,13 +177,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let environment = resolve_environment(cli.production, cli.yes)?;
 
     match cli.command {
-        Command::Consulta {
-            filtro,
-            obligado_emision,
-            xml,
-        } => {
+        Command::Consulta { filtro, xml } => {
             let client = build_verifactu_client(environment)?;
-            let obligado_emision = build_obligado_emision(obligado_emision)?;
+            let obligado_emision = build_obligado_emision(cli.obligado_emision)?;
             let result = client
                 .consulta(&verifactu::schema::ConsultaFactuSistemaFacturacion {
                     cabecera: verifactu::schema::CabeceraConsulta {
@@ -204,12 +199,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_consulta_table(&result);
             }
         }
-        Command::VerifyChain {
-            filtro,
-            obligado_emision,
-        } => {
+        Command::VerifyChain { filtro } => {
             let client = build_verifactu_client(environment)?;
-            let obligado_emision = build_obligado_emision(obligado_emision)?;
+            let obligado_emision = build_obligado_emision(cli.obligado_emision)?;
             let registros = fetch_all_registros(&client, obligado_emision, filtro).await?;
             let checks = verify_chain(&registros);
             print_chain_report(&checks);
