@@ -55,6 +55,11 @@ impl std::error::Error for ValidationError {}
 
 macro_rules! impl_string_type {
     ($name:ident) => {
+        impl_string_type!($name, $name::validate);
+    };
+    // `$received` validates a value read from XML, which may be laxer than
+    // constructing one: an AEAT response must stay readable.
+    ($name:ident, $received:path) => {
         impl $name {
             pub fn as_str(&self) -> &str {
                 &self.0
@@ -126,32 +131,67 @@ macro_rules! impl_string_type {
                 D: serde::Deserializer<'de>,
             {
                 let value = String::deserialize(deserializer)?;
-                Self::try_from(value).map_err(serde::de::Error::custom)
+                $received(&value).map_err(serde::de::Error::custom)?;
+                Ok(Self(value))
             }
         }
     };
 }
 
+/// A value that enters the huella must carry no leading or trailing
+/// whitespace: the hash trims it (AEAT huella specification v0.1.2) but the
+/// XML sends it as given, so a padded value would identify one invoice at the
+/// AEAT and hash as another. Uses the same definition of whitespace as the
+/// hash's `str::trim`.
+fn validate_no_outer_whitespace(
+    value: &str,
+    type_name: &'static str,
+) -> Result<(), ValidationError> {
+    if value.trim() != value {
+        return Err(ValidationError::new(
+            type_name,
+            "cannot start or end with whitespace",
+        ));
+    }
+    Ok(())
+}
+
 macro_rules! string_max_type {
     ($name:ident, $max_len:expr) => {
+        string_max_type!($name, $max_len, |_value: &str| Ok(()));
+    };
+    // A type used in a huella field: rejects outer whitespace as well.
+    ($name:ident, $max_len:expr, hashed) => {
+        string_max_type!($name, $max_len, |value: &str| {
+            validate_no_outer_whitespace(value, stringify!($name))
+        });
+    };
+    ($name:ident, $max_len:expr, $extra:expr) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         pub struct $name(String);
 
         impl $name {
             fn validate(value: &str) -> Result<(), ValidationError> {
+                Self::validate_len(value)?;
+                let extra: fn(&str) -> Result<(), ValidationError> = $extra;
+                extra(value)
+            }
+
+            fn validate_len(value: &str) -> Result<(), ValidationError> {
                 let len = value.chars().count();
                 if len > $max_len {
-                    Err(ValidationError::new(
+                    return Err(ValidationError::new(
                         stringify!($name),
                         format!("must contain at most {} characters, got {}", $max_len, len),
-                    ))
-                } else {
-                    Ok(())
+                    ));
                 }
+                Ok(())
             }
         }
 
-        impl_string_type!($name);
+        // A padded value read back from the AEAT (say, a record another SIF
+        // sent) is kept as received; the huella trims it anyway.
+        impl_string_type!($name, $name::validate_len);
     };
 }
 
@@ -417,7 +457,8 @@ fn is_valid_calendar_date(year: i32, month: u32, day: u32) -> bool {
     day != 0 && day <= max_day
 }
 
-string_max_type!(TextMax60, 60);
+// `NumSerieFactura` is a huella field.
+string_max_type!(TextMax60, 60, hashed);
 string_max_type!(TextMax500, 500);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -501,7 +542,8 @@ impl NIF {
         if value.is_empty() {
             return Err(ValidationError::new("NIF", "cannot be empty"));
         }
-        Ok(())
+        // `IDEmisorFactura` is a huella field.
+        validate_no_outer_whitespace(value, "NIF")
     }
 }
 
@@ -3541,5 +3583,44 @@ mod edge_case_tests {
             xml.contains("<sum1:ImporteTotal>-121.00</sum1:ImporteTotal>"),
             "{xml}"
         );
+    }
+}
+
+#[cfg(test)]
+mod outer_whitespace_tests {
+    use super::*;
+
+    #[test]
+    fn huella_types_reject_outer_whitespace() {
+        for padded in [" A-1", "A-1 ", "\tA-1", "A-1\n"] {
+            assert!(TextMax60::try_from(padded).is_err(), "{padded:?}");
+            assert!(NIF::try_from(padded).is_err(), "{padded:?}");
+        }
+        assert!(TextMax60::try_from("A 1").is_ok());
+        assert!(NIF::try_from("B12345678").is_ok());
+    }
+
+    #[test]
+    fn other_string_types_keep_whitespace() {
+        assert!(TextMax500::try_from(" Servicios ").is_ok());
+    }
+
+    // Reading is lenient: a padded record in an AEAT response is kept as
+    // received rather than failing the whole response.
+    #[test]
+    fn padded_values_in_a_response_still_deserialize() {
+        let xml = "<IDFactura><IDEmisorFactura> B12345678 </IDEmisorFactura><NumSerieFactura> A-1 </NumSerieFactura><FechaExpedicionFactura>15-03-2025</FechaExpedicionFactura></IDFactura>";
+        let id: IDFactura = quick_xml::de::from_str(xml).unwrap();
+        assert_eq!(id.num_serie_factura.as_str(), " A-1 ");
+        assert_eq!(id.id_emisor_factura.as_str(), " B12345678 ");
+    }
+
+    #[test]
+    fn response_length_is_still_checked() {
+        let xml = format!(
+            "<IDFactura><IDEmisorFactura>B12345678</IDEmisorFactura><NumSerieFactura>{}</NumSerieFactura><FechaExpedicionFactura>15-03-2025</FechaExpedicionFactura></IDFactura>",
+            "A".repeat(61)
+        );
+        assert!(quick_xml::de::from_str::<IDFactura>(&xml).is_err());
     }
 }
