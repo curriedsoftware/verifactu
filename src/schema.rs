@@ -1626,11 +1626,11 @@ pub enum TipoFactura {
     #[default]
     F1, // Standard invoice
     F2, // Simplified invoice
-    R1, // Corrective invoice (error in taxable base)
-    R2, // Corrective invoice (article 80.1, 80.2, 80.6 LIVA)
-    R3, // Corrective invoice (article 80.3 LIVA)
-    R4, // Corrective invoice (article 80.4 LIVA)
-    R5, // Corrective invoice (insolvency proceedings)
+    R1, // Corrective invoice (error grounded in law, article 80.1, 80.2, 80.6 LIVA)
+    R2, // Corrective invoice (article 80.3 LIVA, insolvency proceedings)
+    R3, // Corrective invoice (article 80.4 LIVA, uncollectable debts)
+    R4, // Corrective invoice (any other cause)
+    R5, // Corrective invoice for simplified invoices
     F3, // Replacement for simplified invoices
 }
 
