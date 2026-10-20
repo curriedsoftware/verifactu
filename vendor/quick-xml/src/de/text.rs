@@ -1,11 +1,10 @@
 use crate::{
     de::simple_type::SimpleTypeDeserializer,
-    de::{Text, TEXT_KEY},
+    de::{TEXT_KEY, Text},
     errors::serialize::DeError,
 };
 use serde::de::value::BorrowedStrDeserializer;
 use serde::de::{DeserializeSeed, Deserializer, EnumAccess, VariantAccess, Visitor};
-use serde::serde_if_integer128;
 use std::borrow::Cow;
 
 /// A deserializer for a single text node of a mixed sequence of tags and text.

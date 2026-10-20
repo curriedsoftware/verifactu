@@ -2,118 +2,325 @@
 //!
 //! Provides an iterator over attributes key/value pairs
 
+use crate::XmlVersion;
 use crate::encoding::Decoder;
 use crate::errors::Result as XmlResult;
-use crate::escape::{escape, resolve_predefined_entity, unescape_with};
-use crate::name::{LocalName, Namespace, QName};
-use crate::reader::NsReader;
-use crate::utils::{is_whitespace, Bytes};
+use crate::escape::{escape_attribute, resolve_predefined_entity};
+use crate::name::{LocalName, Namespace, NamespaceResolver, QName};
+use crate::utils::is_whitespace;
 
+use std::collections::HashSet;
 use std::fmt::{self, Debug, Display, Formatter};
+use std::hash::{BuildHasherDefault, DefaultHasher, Hasher};
 use std::iter::FusedIterator;
 use std::{borrow::Cow, ops::Range};
 
 /// A struct representing a key/value XML attribute.
 ///
-/// Field `value` stores raw bytes, possibly containing escape-sequences. Most users will likely
-/// want to access the value using one of the [`unescape_value`] and [`decode_and_unescape_value`]
-/// functions.
+/// Field `value` stores the raw attribute value, possibly containing escape-sequences.
+/// Most users will likely want to access the value using the [`normalized_value`] method.
 ///
-/// [`unescape_value`]: Self::unescape_value
-/// [`decode_and_unescape_value`]: Self::decode_and_unescape_value
-#[derive(Clone, Eq, PartialEq)]
+/// # Lifetime
+///
+/// `'a` is a lifetime of the owning event from which this attribute is derived.
+///
+/// [`normalized_value`]: Self::normalized_value
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Attribute<'a> {
     /// The key to uniquely define the attribute.
     ///
     /// If [`Attributes::with_checks`] is turned off, the key might not be unique.
     pub key: QName<'a>,
     /// The raw value of the attribute.
-    pub value: Cow<'a, [u8]>,
+    pub value: Cow<'a, str>,
 }
 
 impl<'a> Attribute<'a> {
-    /// Decodes using UTF-8 then unescapes the value.
+    /// Returns the attribute value normalized as per [the XML specification] (or [for 1.0]).
     ///
-    /// This is normally the value you are interested in. Escape sequences such as `&gt;` are
-    /// replaced with their unescaped equivalents such as `>`.
+    /// The characters `\t`, `\r`, `\n` are replaced with whitespace characters (`0x20`).
+    ///
+    /// The following escape sequences are replaced with their unescaped equivalents:
+    ///
+    /// | Escape Sequence | Replacement
+    /// |-----------------|------------
+    /// | `&lt;`          | `<`
+    /// | `&gt;`          | `>`
+    /// | `&amp;`         | `&`
+    /// | `&apos;`        | `'`
+    /// | `&quot;`        | `"`
+    ///
+    /// This will allocate unless the raw attribute value does not require normalization.
+    ///
+    /// Note, although you may use this library to parse HTML, you cannot use this
+    /// method to get HTML content, because its returns normalized value: the following
+    /// sequences are translated into a single space (U+0020) character:
+    ///
+    /// - `\r\n`
+    /// - `\r\x85` (only XML 1.1)
+    /// - `\r`
+    /// - `\n`
+    /// - `\t`
+    /// - `\x85` (only XML 1.1)
+    /// - `\x2028` (only XML 1.1)
+    ///
+    /// The text in HTML normally is not normalized in any way; normalization is
+    /// performed only in limited contexts and [only for] `\r\n` and `\r`.
+    ///
+    /// See also [`normalized_value_with()`](Self::normalized_value_with).
+    ///
+    /// [the XML specification]: https://www.w3.org/TR/xml11/#AVNormalize
+    /// [for 1.0]: https://www.w3.org/TR/xml/#AVNormalize
+    /// [only for]: https://html.spec.whatwg.org/#normalize-newlines
+    pub fn normalized_value(&self, version: XmlVersion) -> XmlResult<Cow<'a, str>> {
+        // resolve_predefined_entity returns only non-recursive replacements, so depth=1 is enough
+        self.normalized_value_with(version, 1, resolve_predefined_entity)
+    }
+
+    /// Returns the attribute value normalized as per [the XML specification] (or [for 1.0]),
+    /// using a custom entity resolver.
+    ///
+    /// Do not use this method with HTML attributes.
+    ///
+    /// The characters `\t`, `\r`, `\n` are replaced with whitespace characters (`0x20`).
+    ///
+    /// A function for resolving entities can be provided as `resolve_entity`.
+    /// This method does not resolve any predefined entities, but you can use
+    /// [`resolve_predefined_entity`] in your function.
+    ///
+    /// This will allocate unless the raw attribute value does not require normalization.
+    ///
+    /// Note, although you may use this library to parse HTML, you cannot use this
+    /// method to get HTML content, because its returns normalized value: the following
+    /// sequences are translated into a single space (U+0020) character:
+    ///
+    /// - `\r\n`
+    /// - `\r\x85` (only XML 1.1)
+    /// - `\r`
+    /// - `\n`
+    /// - `\t`
+    /// - `\x85` (only XML 1.1)
+    /// - `\x2028` (only XML 1.1)
+    ///
+    /// The text in HTML normally is not normalized in any way; normalization is
+    /// performed only in limited contexts and [only for] `\r\n` and `\r`.
+    ///
+    /// See also [`normalized_value()`](Self::normalized_value).
+    ///
+    /// # Parameters
+    ///
+    /// - `depth`: maximum number of nested entities that can be expanded. If expansion
+    ///   chain will be more that this value, the function will return [`EscapeError::TooManyNestedEntities`]
+    /// - `resolve_entity`: a function to resolve entity. This function could be called
+    ///   multiple times on the same input and can return different values in each case
+    ///   for the same input, although it is not recommended
+    ///
+    /// [the XML specification]: https://www.w3.org/TR/xml11/#AVNormalize
+    /// [for 1.0]: https://www.w3.org/TR/xml/#AVNormalize
+    /// [only for]: https://html.spec.whatwg.org/#normalize-newlines
+    /// [`EscapeError::TooManyNestedEntities`]: crate::escape::EscapeError::TooManyNestedEntities
+    pub fn normalized_value_with<'entity>(
+        &self,
+        version: XmlVersion,
+        depth: usize,
+        resolve_entity: impl FnMut(&str) -> Option<&'entity str>,
+    ) -> XmlResult<Cow<'a, str>> {
+        match version.normalize_attribute_value(&self.value, depth, resolve_entity)? {
+            // Because result is borrowed, no replacements was done and we can use original string
+            Cow::Borrowed(_) => Ok(self.value.clone()),
+            Cow::Owned(s) => Ok(s.into()),
+        }
+    }
+
+    /// Decodes using a provided reader and returns the attribute value normalized
+    /// as per [the XML specification] (or [for 1.0]).
+    ///
+    /// # Deprecation
+    ///
+    /// Attribute values are now always stored as valid UTF-8 strings, so decoding
+    /// is no longer needed. Use [`normalized_value()`](Self::normalized_value) instead.
+    ///
+    /// Do not use this method with HTML attributes.
+    ///
+    /// The characters `\t`, `\r`, `\n` are replaced with whitespace characters (`0x20`).
+    ///
+    /// The following escape sequences are replaced with their unescaped equivalents:
+    ///
+    /// | Escape Sequence | Replacement
+    /// |-----------------|------------
+    /// | `&lt;`          | `<`
+    /// | `&gt;`          | `>`
+    /// | `&amp;`         | `&`
+    /// | `&apos;`        | `'`
+    /// | `&quot;`        | `"`
+    ///
+    /// This will allocate unless the raw attribute value does not require normalization.
+    ///
+    /// Note, although you may use this library to parse HTML, you cannot use this
+    /// method to get HTML content, because its returns normalized value: the following
+    /// sequences are translated into a single space (U+0020) character:
+    ///
+    /// - `\r\n`
+    /// - `\r\x85` (only XML 1.1)
+    /// - `\r`
+    /// - `\n`
+    /// - `\t`
+    /// - `\x85` (only XML 1.1)
+    /// - `\x2028` (only XML 1.1)
+    ///
+    /// The text in HTML normally is not normalized in any way; normalization is
+    /// performed only in limited contexts and [only for] `\r\n` and `\r`.
+    ///
+    /// See also [`decoded_and_normalized_value_with()`](#method.decoded_and_normalized_value_with)
+    ///
+    /// [the XML specification]: https://www.w3.org/TR/xml11/#AVNormalize
+    /// [for 1.0]: https://www.w3.org/TR/xml/#AVNormalize
+    /// [only for]: https://html.spec.whatwg.org/#normalize-newlines
+    #[deprecated = "decoding is no longer needed, use `normalized_value()` instead"]
+    #[inline]
+    pub fn decoded_and_normalized_value(
+        &self,
+        version: XmlVersion,
+        _decoder: Decoder,
+    ) -> XmlResult<Cow<'a, str>> {
+        self.normalized_value(version)
+    }
+
+    /// Decodes using a provided reader and returns the attribute value normalized
+    /// as per [the XML specification] (or [for 1.0]), using a custom entity resolver.
+    ///
+    /// # Deprecation
+    ///
+    /// Attribute values are now always stored as valid UTF-8 strings, so decoding
+    /// is no longer needed. Use [`normalized_value_with()`](Self::normalized_value_with) instead.
+    ///
+    /// Do not use this method with HTML attributes.
+    ///
+    /// The characters `\t`, `\r`, `\n` are replaced with whitespace characters (`0x20`).
+    ///
+    /// A function for resolving entities can be provided as `resolve_entity`.
+    /// This method does not resolve any predefined entities, but you can use
+    /// [`resolve_predefined_entity`] in your function.
+    ///
+    /// This will allocate unless the raw attribute value does not require normalization.
+    ///
+    /// Note, although you may use this library to parse HTML, you cannot use this
+    /// method to get HTML content, because its returns normalized value: the following
+    /// sequences are translated into a single space (U+0020) character:
+    ///
+    /// - `\r\n`
+    /// - `\r\x85` (only XML 1.1)
+    /// - `\r`
+    /// - `\n`
+    /// - `\t`
+    /// - `\x85` (only XML 1.1)
+    /// - `\x2028` (only XML 1.1)
+    ///
+    /// The text in HTML normally is not normalized in any way; normalization is
+    /// performed only in limited contexts and [only for] `\r\n` and `\r`.
+    ///
+    /// See also [`decoded_and_normalized_value()`](#method.decoded_and_normalized_value)
+    ///
+    /// # Parameters
+    ///
+    /// - `depth`: maximum number of nested entities that can be expanded. If expansion
+    ///   chain will be more that this value, the function will return [`EscapeError::TooManyNestedEntities`]
+    /// - `resolve_entity`: a function to resolve entity. This function could be called
+    ///   multiple times on the same input and can return different values in each case
+    ///   for the same input, although it is not recommended
+    ///
+    /// [the XML specification]: https://www.w3.org/TR/xml11/#AVNormalize
+    /// [for 1.0]: https://www.w3.org/TR/xml/#AVNormalize
+    /// [only for]: https://html.spec.whatwg.org/#normalize-newlines
+    /// [`EscapeError::TooManyNestedEntities`]: crate::escape::EscapeError::TooManyNestedEntities
+    #[deprecated = "decoding is no longer needed, use `normalized_value_with()` instead"]
+    #[inline]
+    pub fn decoded_and_normalized_value_with<'entity>(
+        &self,
+        version: XmlVersion,
+        _decoder: Decoder,
+        depth: usize,
+        resolve_entity: impl FnMut(&str) -> Option<&'entity str>,
+    ) -> XmlResult<Cow<'a, str>> {
+        self.normalized_value_with(version, depth, resolve_entity)
+    }
+
+    /// Returns the unescaped value.
+    ///
+    /// # Deprecation
+    ///
+    /// Use [`normalized_value()`](Self::normalized_value) instead.
+    ///
+    /// Escape sequences such as `&gt;` are replaced with their unescaped
+    /// equivalents such as `>`.
     ///
     /// This will allocate if the value contains any escape sequences.
     ///
     /// See also [`unescape_value_with()`](Self::unescape_value_with)
     ///
-    /// <div style="background:rgba(120,145,255,0.45);padding:0.75em;">
-    ///
-    /// NOTE: Because this method is available only if [`encoding`] feature is **not** enabled,
-    /// should only be used by applications.
-    /// Libs should use [`decode_and_unescape_value()`](Self::decode_and_unescape_value)
-    /// instead, because if lib will be used in a project which depends on quick_xml with
-    /// [`encoding`] feature enabled, the lib will fail to compile due to [feature unification].
-    ///
-    /// </div>
-    ///
     /// [`encoding`]: ../../index.html#encoding
-    /// [feature unification]: https://doc.rust-lang.org/cargo/reference/features.html#feature-unification
     #[cfg(any(doc, not(feature = "encoding")))]
+    #[deprecated = "use `Self::normalized_value()`"]
     pub fn unescape_value(&self) -> XmlResult<Cow<'a, str>> {
-        self.unescape_value_with(resolve_predefined_entity)
+        // resolve_predefined_entity returns only non-recursive replacements, so depth=1 is enough
+        self.normalized_value_with(XmlVersion::Implicit1_0, 1, resolve_predefined_entity)
     }
 
     /// Decodes using UTF-8 then unescapes the value, using custom entities.
     ///
-    /// This is normally the value you are interested in. Escape sequences such as `&gt;` are
-    /// replaced with their unescaped equivalents such as `>`.
-    /// A fallback resolver for additional custom entities can be provided via
-    /// `resolve_entity`.
+    /// # Deprecation
+    ///
+    /// Use [`normalized_value_with()`](Self::normalized_value_with) instead.
+    ///
+    /// Escape sequences such as `&gt;` are replaced with their unescaped
+    /// equivalents such as `>`. A fallback resolver for additional custom
+    /// entities can be provided via `resolve_entity`.
     ///
     /// This will allocate if the value contains any escape sequences.
     ///
     /// See also [`unescape_value()`](Self::unescape_value)
     ///
-    /// <div style="background:rgba(120,145,255,0.45);padding:0.75em;">
-    ///
-    /// NOTE: Because this method is available only if [`encoding`] feature is **not** enabled,
-    /// should only be used by applications.
-    /// Libs should use [`decode_and_unescape_value_with()`](Self::decode_and_unescape_value_with)
-    /// instead, because if lib will be used in a project which depends on quick_xml with
-    /// [`encoding`] feature enabled, the lib will fail to compile due to [feature unification].
-    ///
-    /// </div>
-    ///
     /// [`encoding`]: ../../index.html#encoding
-    /// [feature unification]: https://doc.rust-lang.org/cargo/reference/features.html#feature-unification
     #[cfg(any(doc, not(feature = "encoding")))]
+    #[deprecated = "use `Self::normalized_value_with()`"]
     #[inline]
     pub fn unescape_value_with<'entity>(
         &self,
         resolve_entity: impl FnMut(&str) -> Option<&'entity str>,
     ) -> XmlResult<Cow<'a, str>> {
-        self.decode_and_unescape_value_with(Decoder::utf8(), resolve_entity)
+        self.normalized_value_with(XmlVersion::Implicit1_0, 128, resolve_entity)
     }
 
     /// Decodes then unescapes the value.
     ///
-    /// This will allocate if the value contains any escape sequences or in
-    /// non-UTF-8 encoding.
-    pub fn decode_and_unescape_value(&self, decoder: Decoder) -> XmlResult<Cow<'a, str>> {
-        self.decode_and_unescape_value_with(decoder, resolve_predefined_entity)
+    /// # Deprecation
+    ///
+    /// Attribute values are now always stored as valid UTF-8 strings, so decoding
+    /// is no longer needed. Use [`normalized_value()`](Self::normalized_value) instead.
+    ///
+    /// This will allocate if the value contains any escape sequences.
+    #[deprecated = "decoding is no longer needed, use `Self::normalized_value()` instead"]
+    #[inline]
+    pub fn decode_and_unescape_value(&self, _decoder: Decoder) -> XmlResult<Cow<'a, str>> {
+        self.normalized_value(XmlVersion::Implicit1_0)
     }
 
     /// Decodes then unescapes the value with custom entities.
     ///
-    /// This will allocate if the value contains any escape sequences or in
-    /// non-UTF-8 encoding.
+    /// # Deprecation
+    ///
+    /// Attribute values are now always stored as valid UTF-8 strings, so decoding
+    /// is no longer needed. Use [`normalized_value_with()`](Self::normalized_value_with) instead.
+    ///
+    /// This will allocate if the value contains any escape sequences.
+    #[deprecated = "decoding is no longer needed, use `Self::normalized_value_with()` instead"]
+    #[inline]
     pub fn decode_and_unescape_value_with<'entity>(
         &self,
-        decoder: Decoder,
+        _decoder: Decoder,
         resolve_entity: impl FnMut(&str) -> Option<&'entity str>,
     ) -> XmlResult<Cow<'a, str>> {
-        let decoded = decoder.decode_cow(&self.value)?;
-
-        match unescape_with(&decoded, resolve_entity)? {
-            // Because result is borrowed, no replacements was done and we can use original string
-            Cow::Borrowed(_) => Ok(decoded),
-            Cow::Owned(s) => Ok(s.into()),
-        }
+        self.normalized_value_with(XmlVersion::Implicit1_0, 128, resolve_entity)
     }
 
     /// If attribute value [represents] valid boolean values, returns `Some`, otherwise returns `None`.
@@ -138,7 +345,7 @@ impl<'a> Attribute<'a> {
     /// let attr = Attribute::from(("attr", "1"));
     /// assert_eq!(attr.as_bool(), Some(true));
     ///
-    /// let attr = Attribute::from(("attr", "bot bool"));
+    /// let attr = Attribute::from(("attr", "not bool"));
     /// assert_eq!(attr.as_bool(), None);
     /// ```
     ///
@@ -146,39 +353,9 @@ impl<'a> Attribute<'a> {
     #[inline]
     pub fn as_bool(&self) -> Option<bool> {
         match self.value.as_ref() {
-            b"1" | b"true" => Some(true),
-            b"0" | b"false" => Some(false),
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
             _ => None,
-        }
-    }
-}
-
-impl<'a> Debug for Attribute<'a> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        f.debug_struct("Attribute")
-            .field("key", &Bytes(self.key.as_ref()))
-            .field("value", &Bytes(&self.value))
-            .finish()
-    }
-}
-
-impl<'a> From<(&'a [u8], &'a [u8])> for Attribute<'a> {
-    /// Creates new attribute from raw bytes.
-    /// Does not apply any transformation to both key and value.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use pretty_assertions::assert_eq;
-    /// use quick_xml::events::attributes::Attribute;
-    ///
-    /// let features = Attribute::from(("features".as_bytes(), "Bells &amp; whistles".as_bytes()));
-    /// assert_eq!(features.value, "Bells &amp; whistles".as_bytes());
-    /// ```
-    fn from(val: (&'a [u8], &'a [u8])) -> Attribute<'a> {
-        Attribute {
-            key: QName(val.0),
-            value: Cow::from(val.1),
         }
     }
 }
@@ -194,15 +371,12 @@ impl<'a> From<(&'a str, &'a str)> for Attribute<'a> {
     /// use quick_xml::events::attributes::Attribute;
     ///
     /// let features = Attribute::from(("features", "Bells & whistles"));
-    /// assert_eq!(features.value, "Bells &amp; whistles".as_bytes());
+    /// assert_eq!(features.value.as_ref(), "Bells &amp; whistles");
     /// ```
     fn from(val: (&'a str, &'a str)) -> Attribute<'a> {
         Attribute {
-            key: QName(val.0.as_bytes()),
-            value: match escape(val.1) {
-                Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
-                Cow::Owned(s) => Cow::Owned(s.into_bytes()),
-            },
+            key: QName(val.0),
+            value: escape_attribute(val.1),
         }
     }
 }
@@ -219,22 +393,19 @@ impl<'a> From<(&'a str, Cow<'a, str>)> for Attribute<'a> {
     /// use quick_xml::events::attributes::Attribute;
     ///
     /// let features = Attribute::from(("features", Cow::Borrowed("Bells & whistles")));
-    /// assert_eq!(features.value, "Bells &amp; whistles".as_bytes());
+    /// assert_eq!(features.value.as_ref(), "Bells &amp; whistles");
     /// ```
     fn from(val: (&'a str, Cow<'a, str>)) -> Attribute<'a> {
         Attribute {
-            key: QName(val.0.as_bytes()),
-            value: match escape(val.1) {
-                Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
-                Cow::Owned(s) => Cow::Owned(s.into_bytes()),
-            },
+            key: QName(val.0),
+            value: escape_attribute(val.1),
         }
     }
 }
 
-impl<'a> From<Attr<&'a [u8]>> for Attribute<'a> {
+impl<'a> From<Attr<&'a str>> for Attribute<'a> {
     #[inline]
-    fn from(attr: Attr<&'a [u8]>) -> Self {
+    fn from(attr: Attr<&'a str>) -> Self {
         Self {
             key: attr.key(),
             value: Cow::Borrowed(attr.value()),
@@ -251,26 +422,27 @@ impl<'a> From<Attr<&'a [u8]>> for Attribute<'a> {
 ///
 /// When [`serialize`] feature is enabled, can be converted to serde's deserializer.
 ///
+/// # Lifetime
+///
+/// `'a` is a lifetime of the owning event from which this iterator is derived.
+///
 /// [`with_checks(false)`]: Self::with_checks
 /// [`serialize`]: ../../index.html#serialize
 #[derive(Clone)]
 pub struct Attributes<'a> {
     /// Slice of `BytesStart` corresponding to attributes
-    bytes: &'a [u8],
+    buf: &'a str,
     /// Iterator state, independent from the actual source of bytes
     state: IterState,
-    /// Encoding used for `bytes`
-    decoder: Decoder,
 }
 
 impl<'a> Attributes<'a> {
     /// Internal constructor, used by `BytesStart`. Supplies data in reader's encoding
     #[inline]
-    pub(crate) const fn wrap(buf: &'a [u8], pos: usize, html: bool, decoder: Decoder) -> Self {
+    pub(crate) const fn wrap(buf: &'a str, pos: usize, html: bool) -> Self {
         Self {
-            bytes: buf,
+            buf,
             state: IterState::new(pos, html),
-            decoder,
         }
     }
 
@@ -298,7 +470,7 @@ impl<'a> Attributes<'a> {
     /// assert_eq!(iter.next(), None);
     /// ```
     pub const fn new(buf: &'a str, pos: usize) -> Self {
-        Self::wrap(buf.as_bytes(), pos, false, Decoder::utf8())
+        Self::wrap(buf, pos, false)
     }
 
     /// Creates a new attribute iterator from a buffer, allowing HTML attribute syntax.
@@ -323,7 +495,7 @@ impl<'a> Attributes<'a> {
     /// assert_eq!(iter.next(), None);
     /// ```
     pub const fn html(buf: &'a str, pos: usize) -> Self {
-        Self::wrap(buf.as_bytes(), pos, true, Decoder::utf8())
+        Self::wrap(buf, pos, true)
     }
 
     /// Changes whether attributes should be checked for uniqueness.
@@ -367,8 +539,8 @@ impl<'a> Attributes<'a> {
     ///             e => panic!("Unexpected event {:?}", e),
     ///         };
     ///         assert_eq!(
-    ///             (event.name(), event.attributes().has_nil(&$reader)),
-    ///             (QName($name.as_bytes()), $value),
+    ///             (event.name(), event.attributes().has_nil($reader.resolver())),
+    ///             (QName($name), $value),
     ///         );
     ///     };
     /// }
@@ -377,7 +549,7 @@ impl<'a> Attributes<'a> {
     ///     Event::Start(e) => e,
     ///     e => panic!("Unexpected event {:?}", e),
     /// };
-    /// assert_eq!(root.attributes().has_nil(&reader), false);
+    /// assert_eq!(root.attributes().has_nil(reader.resolver()), false);
     ///
     /// // definitely true
     /// check!(reader, "true",          true);
@@ -394,15 +566,15 @@ impl<'a> Attributes<'a> {
     /// ```
     ///
     /// [`xsi:nil`]: https://www.w3.org/TR/xmlschema-1/#xsi_nil
-    pub fn has_nil<R>(&mut self, reader: &NsReader<R>) -> bool {
+    pub fn has_nil(&mut self, resolver: &NamespaceResolver) -> bool {
         use crate::name::ResolveResult::*;
 
         self.any(|attr| {
             if let Ok(attr) = attr {
-                match reader.resolver().resolve_attribute(attr.key) {
+                match resolver.resolve_attribute(attr.key) {
                     (
-                        Bound(Namespace(b"http://www.w3.org/2001/XMLSchema-instance")),
-                        LocalName(b"nil"),
+                        Bound(Namespace("http://www.w3.org/2001/XMLSchema-instance")),
+                        LocalName("nil"),
                     ) => attr.as_bool().unwrap_or_default(),
                     _ => false,
                 }
@@ -411,30 +583,13 @@ impl<'a> Attributes<'a> {
             }
         })
     }
-
-    /// Get the decoder, used to decode bytes, read by the reader which produces
-    /// this iterator, to the strings.
-    ///
-    /// When iterator was created manually or get from a manually created [`BytesStart`],
-    /// encoding is UTF-8.
-    ///
-    /// If [`encoding`] feature is enabled and no encoding is specified in declaration,
-    /// defaults to UTF-8.
-    ///
-    /// [`BytesStart`]: crate::events::BytesStart
-    /// [`encoding`]: ../index.html#encoding
-    #[inline]
-    pub const fn decoder(&self) -> Decoder {
-        self.decoder
-    }
 }
 
 impl<'a> Debug for Attributes<'a> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_struct("Attributes")
-            .field("bytes", &Bytes(self.bytes))
+            .field("buf", &self.buf)
             .field("state", &self.state)
-            .field("decoder", &self.decoder)
             .finish()
     }
 }
@@ -444,9 +599,9 @@ impl<'a> Iterator for Attributes<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        match self.state.next(self.bytes) {
+        match self.state.next(self.buf.as_bytes()) {
             None => None,
-            Some(Ok(a)) => Some(Ok(a.map(|range| &self.bytes[range]).into())),
+            Some(Ok(a)) => Some(Ok(a.map(|range| &self.buf[range]).into())),
             Some(Err(e)) => Some(Err(e)),
         }
     }
@@ -485,7 +640,7 @@ pub enum AttrError {
     /// ```
     ///
     /// This error can be returned only for the last attribute in the list,
-    /// because otherwise any content after `=` will be threated as a value.
+    /// because otherwise any content after `=` will be treated as a value.
     /// The XML
     ///
     /// ```xml
@@ -628,54 +783,50 @@ impl<T> Attr<T> {
     }
 }
 
-impl<'a> Attr<&'a [u8]> {
+impl<'a> Attr<&'a str> {
     /// Returns the key value
     #[inline]
     pub const fn key(&self) -> QName<'a> {
         QName(match self {
-            Attr::DoubleQ(key, _) => key,
-            Attr::SingleQ(key, _) => key,
-            Attr::Empty(key) => key,
-            Attr::Unquoted(key, _) => key,
+            Attr::DoubleQ(key, _) => *key,
+            Attr::SingleQ(key, _) => *key,
+            Attr::Empty(key) => *key,
+            Attr::Unquoted(key, _) => *key,
         })
     }
-    /// Returns the attribute value. For [`Self::Empty`] variant an empty slice
+    /// Returns the attribute value. For [`Self::Empty`] variant an empty string
     /// is returned according to the [HTML specification].
     ///
     /// [HTML specification]: https://www.w3.org/TR/2012/WD-html-markup-20120329/syntax.html#syntax-attr-empty
     #[inline]
-    pub const fn value(&self) -> &'a [u8] {
+    pub const fn value(&self) -> &'a str {
         match self {
-            Attr::DoubleQ(_, value) => value,
-            Attr::SingleQ(_, value) => value,
-            Attr::Empty(_) => &[],
-            Attr::Unquoted(_, value) => value,
+            Attr::DoubleQ(_, value) => *value,
+            Attr::SingleQ(_, value) => *value,
+            Attr::Empty(_) => "",
+            Attr::Unquoted(_, value) => *value,
         }
     }
 }
 
-impl<T: AsRef<[u8]>> Debug for Attr<T> {
+impl<T: Debug> Debug for Attr<T> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             Attr::DoubleQ(key, value) => f
                 .debug_tuple("Attr::DoubleQ")
-                .field(&Bytes(key.as_ref()))
-                .field(&Bytes(value.as_ref()))
+                .field(key)
+                .field(value)
                 .finish(),
             Attr::SingleQ(key, value) => f
                 .debug_tuple("Attr::SingleQ")
-                .field(&Bytes(key.as_ref()))
-                .field(&Bytes(value.as_ref()))
+                .field(key)
+                .field(value)
                 .finish(),
-            Attr::Empty(key) => f
-                .debug_tuple("Attr::Empty")
-                // Comment to prevent formatting and keep style consistent
-                .field(&Bytes(key.as_ref()))
-                .finish(),
+            Attr::Empty(key) => f.debug_tuple("Attr::Empty").field(key).finish(),
             Attr::Unquoted(key, value) => f
                 .debug_tuple("Attr::Unquoted")
-                .field(&Bytes(key.as_ref()))
-                .field(&Bytes(value.as_ref()))
+                .field(key)
+                .field(value)
                 .finish(),
         }
     }
@@ -715,6 +866,53 @@ enum State {
     SkipEqValue(usize),
 }
 
+/// Number of attributes a start tag may have before the duplicate-name check
+/// switches from a direct linear scan of the previously seen names to a hash
+/// pre-filter (see [`IterState::check_for_duplicates`]).
+///
+/// Real-world start tags carry only a handful of attributes -- the busiest
+/// element in our benchmark corpus (`tests/documents/players.xml`) has 22 --
+/// where the scan is faster than hashing and needs no allocation. Larger tags
+/// are where the scan became the O(N²) CPU-DoS of [#969], so above this count we
+/// pay for a hash set to keep the whole tag O(N). The value sits just above the
+/// measured linear-vs-hash crossover.
+///
+/// [#969]: https://github.com/tafia/quick-xml/issues/969
+const SMALL_ATTRIBUTE_COUNT: usize = 32;
+
+/// A no-op [`Hasher`] for the `key_hashes` set, whose values are already 64-bit
+/// hashes of attribute names; re-hashing them with the default SipHash would be
+/// wasted work. Only `write_u64` is ever exercised (via `u64`'s `Hash` impl).
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, _: &[u8]) {
+        // The set only ever stores `u64` keys, which route through `write_u64`.
+        unreachable!("IdentityHasher only supports u64 keys")
+    }
+
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+/// Hashes a single attribute name. A fresh [`DefaultHasher`] per name keeps each
+/// hash independent (so it is also DoS-resistant on untrusted input).
+#[inline]
+fn hash_name(name: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(name);
+    hasher.finish()
+}
+
 /// External iterator over spans of attribute key and value
 #[derive(Clone, Debug)]
 pub(crate) struct IterState {
@@ -730,6 +928,13 @@ pub(crate) struct IterState {
     /// names. We store a ranges instead of slices to able to report a previous
     /// attribute position
     keys: Vec<Range<usize>>,
+    /// 64-bit hashes of the byte content of `keys`, used as an O(1) pre-filter
+    /// once a start tag declares more than `SMALL_ATTRIBUTE_COUNT` attributes, so
+    /// the duplicate check stays O(N) over the whole tag instead of O(N²). The
+    /// values are already hashes, so the set stores them with `IdentityHasher`
+    /// instead of re-hashing. Allocated only when the threshold is crossed, so
+    /// small tags (and [`IterState::new`]) stay allocation-free and `const`.
+    key_hashes: Option<HashSet<u64, BuildHasherDefault<IdentityHasher>>>,
 }
 
 impl IterState {
@@ -739,6 +944,7 @@ impl IterState {
             html,
             check_duplicates: true,
             keys: Vec::new(),
+            key_hashes: None,
         }
     }
 
@@ -748,7 +954,8 @@ impl IterState {
     fn recover(&self, slice: &[u8]) -> Option<usize> {
         match self.state {
             State::Done => None,
-            State::Next(offset) => Some(offset),
+            State::Next(offset) if offset <= slice.len() => Some(offset),
+            State::Next(_) => None,
             State::SkipValue(offset) => self.skip_value(slice, offset),
             State::SkipEqValue(offset) => self.skip_eq_value(slice, offset),
         }
@@ -760,7 +967,7 @@ impl IterState {
     fn skip_value(&self, slice: &[u8], offset: usize) -> Option<usize> {
         let mut iter = (offset..).zip(slice[offset..].iter());
 
-        match iter.find(|(_, &b)| is_whitespace(b)) {
+        match iter.find(|&(_, &b)| is_whitespace(b)) {
             // Input: `    key  =  value `
             //                     |    ^
             //                offset    e
@@ -778,7 +985,7 @@ impl IterState {
         let mut iter = (offset..).zip(slice[offset..].iter());
 
         // Skip all up to the quote and get the quote type
-        let quote = match iter.find(|(_, &b)| !is_whitespace(b)) {
+        let quote = match iter.find(|&(_, &b)| !is_whitespace(b)) {
             // Input: `    key  =  "`
             //                  |  ^
             //             offset
@@ -798,7 +1005,7 @@ impl IterState {
             None => return None,
         };
 
-        match iter.find(|(_, &b)| b == quote) {
+        match iter.find(|&(_, &b)| b == quote) {
             // Input: `    key  =  "   "`
             //                         ^
             Some((e, b'"')) => Some(e),
@@ -814,6 +1021,17 @@ impl IterState {
         }
     }
 
+    /// Checks that the attribute name `key` (a range into `slice`) was not seen
+    /// earlier in the same start tag, recording it for subsequent checks.
+    ///
+    /// Small tags use a direct linear scan of [`Self::keys`]: for a handful of
+    /// attributes that beats hashing and needs no allocation, which is the
+    /// overwhelmingly common case. Once a tag declares more than
+    /// `SMALL_ATTRIBUTE_COUNT` attributes -- where the scan would become the
+    /// O(N²) CPU-DoS of [#969] -- it switches to a hash pre-filter that keeps the
+    /// whole tag O(N).
+    ///
+    /// [#969]: https://github.com/tafia/quick-xml/issues/969
     #[inline]
     fn check_for_duplicates(
         &mut self,
@@ -821,6 +1039,9 @@ impl IterState {
         key: Range<usize>,
     ) -> Result<Range<usize>, AttrError> {
         if self.check_duplicates {
+            if self.keys.len() >= SMALL_ATTRIBUTE_COUNT {
+                return self.check_for_duplicates_hashed(slice, key);
+            }
             if let Some(prev) = self
                 .keys
                 .iter()
@@ -830,6 +1051,44 @@ impl IterState {
             }
             self.keys.push(key.clone());
         }
+        Ok(key)
+    }
+
+    /// Cold path of [`Self::check_for_duplicates`] for start tags with many
+    /// attributes: a [`HashSet`] of 64-bit name hashes acts as an O(1) pre-filter
+    /// so iterating N attributes is O(N) rather than O(N²).
+    #[cold]
+    fn check_for_duplicates_hashed(
+        &mut self,
+        slice: &[u8],
+        key: Range<usize>,
+    ) -> Result<Range<usize>, AttrError> {
+        let keys = &self.keys;
+        let key_hashes = self.key_hashes.get_or_insert_with(|| {
+            // First time over the threshold: seed the set with the names already
+            // collected during the linear phase so the pre-filter knows them.
+            let mut set = HashSet::with_capacity_and_hasher(
+                keys.len() * 2,
+                BuildHasherDefault::<IdentityHasher>::default(),
+            );
+            for r in keys {
+                set.insert(hash_name(&slice[r.clone()]));
+            }
+            set
+        });
+        // A fresh hash proves the name is new. On a hit (a real duplicate, or the
+        // astronomically rare 64-bit collision) fall back to the linear scan to
+        // recover the exact previous position for `AttrError::Duplicated`.
+        if !key_hashes.insert(hash_name(&slice[key.clone()])) {
+            if let Some(prev) = self
+                .keys
+                .iter()
+                .find(|r| slice[(*r).clone()] == slice[key.clone()])
+            {
+                return Err(AttrError::Duplicated(key.start, prev.start));
+            }
+        }
+        self.keys.push(key.clone());
         Ok(key)
     }
 
@@ -868,7 +1127,7 @@ impl IterState {
         };
 
         // Index where next key started
-        let start_key = match iter.find(|(_, &b)| !is_whitespace(b)) {
+        let start_key = match iter.find(|&(_, &b)| !is_whitespace(b)) {
             // Input: `    key`
             //             ^
             Some((s, _)) => s,
@@ -881,7 +1140,7 @@ impl IterState {
             }
         };
         // Span of a key
-        let (key, offset) = match iter.find(|(_, &b)| b == b'=' || is_whitespace(b)) {
+        let (key, offset) = match iter.find(|&(_, &b)| b == b'=' || is_whitespace(b)) {
             // Input: `    key=`
             //             |  ^
             //             s  e
@@ -889,7 +1148,7 @@ impl IterState {
 
             // Input: `    key `
             //                ^
-            Some((e, _)) => match iter.find(|(_, &b)| !is_whitespace(b)) {
+            Some((e, _)) => match iter.find(|&(_, &b)| !is_whitespace(b)) {
                 // Input: `    key  =`
                 //             |  | ^
                 //     start_key  e
@@ -937,7 +1196,7 @@ impl IterState {
         ////////////////////////////////////////////////////////////////////////
 
         // Gets the position of quote and quote type
-        let (start_value, quote) = match iter.find(|(_, &b)| !is_whitespace(b)) {
+        let (start_value, quote) = match iter.find(|&(_, &b)| !is_whitespace(b)) {
             // Input: `    key  =  "`
             //                     ^
             Some((s, b'"')) => (s + 1, b'"'),
@@ -952,7 +1211,7 @@ impl IterState {
                 // We do not check validity of attribute value characters as required
                 // according to https://html.spec.whatwg.org/#unquoted. It can be done
                 // during validation phase
-                let end = match iter.find(|(_, &b)| is_whitespace(b)) {
+                let end = match iter.find(|&(_, &b)| is_whitespace(b)) {
                     // Input: `    key  =  value `
                     //                     |    ^
                     //                     s    e
@@ -981,7 +1240,7 @@ impl IterState {
             }
         };
 
-        match iter.find(|(_, &b)| b == quote) {
+        match iter.find(|&(_, &b)| b == quote) {
             // Input: `    key  =  "   "`
             //                         ^
             Some((e, b'"')) => self.double_q(key, start_value..e),
@@ -1011,6 +1270,229 @@ mod xml {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    #[test]
+    fn start_position_at_end_is_empty() {
+        let mut attributes = Attributes::new("a", 1);
+        assert_eq!(attributes.next(), None);
+
+        let mut attributes = Attributes::html("a", 1);
+        assert_eq!(attributes.next(), None);
+
+        let mut attributes = Attributes::new("a", 1);
+        assert!(!attributes.has_nil(&NamespaceResolver::default()));
+    }
+
+    #[test]
+    fn start_position_past_end_is_empty() {
+        let mut attributes = Attributes::new("a", 2);
+        assert_eq!(attributes.next(), None);
+
+        let mut attributes = Attributes::html("a", 2);
+        assert_eq!(attributes.next(), None);
+
+        let mut attributes = Attributes::new("a", 2);
+        assert!(!attributes.has_nil(&NamespaceResolver::default()));
+    }
+
+    mod attribute_value_normalization {
+        use super::*;
+        use crate::XmlVersion::*;
+        use crate::errors::Error;
+        use crate::escape::EscapeError::*;
+        use pretty_assertions::assert_eq;
+
+        /// Empty values returned are unchanged
+        #[test]
+        fn empty() {
+            let raw_value = "";
+            let attr = Attribute {
+                key: QName("foo"),
+                value: Cow::Borrowed(raw_value),
+            };
+
+            let value = attr.normalized_value(Implicit1_0).unwrap();
+            assert_eq!(value, "");
+            // assert_eq! does not check if value is borrowed, but this is important
+            assert!(matches!(value, Cow::Borrowed(_)));
+
+            let value = attr.normalized_value(Explicit1_0).unwrap();
+            assert_eq!(value, "");
+            // assert_eq! does not check if value is borrowed, but this is important
+            assert!(matches!(value, Cow::Borrowed(_)));
+
+            let value = attr.normalized_value(Explicit1_1).unwrap();
+            assert_eq!(value, "");
+            // assert_eq! does not check if value is borrowed, but this is important
+            assert!(matches!(value, Cow::Borrowed(_)));
+        }
+
+        /// Already normalized values are returned unchanged
+        #[test]
+        fn already_normalized() {
+            let raw_value = "foobar123";
+            let attr = Attribute {
+                key: QName("foo"),
+                value: Cow::Borrowed(raw_value),
+            };
+
+            let value = attr.normalized_value(Implicit1_0).unwrap();
+            assert_eq!(value, "foobar123");
+            // assert_eq! does not check if value is borrowed, but this is important
+            assert!(matches!(value, Cow::Borrowed(_)));
+
+            let value = attr.normalized_value(Explicit1_0).unwrap();
+            assert_eq!(value, "foobar123");
+            // assert_eq! does not check if value is borrowed, but this is important
+            assert!(matches!(value, Cow::Borrowed(_)));
+
+            let value = attr.normalized_value(Explicit1_1).unwrap();
+            assert_eq!(value, "foobar123");
+            // assert_eq! does not check if value is borrowed, but this is important
+            assert!(matches!(value, Cow::Borrowed(_)));
+        }
+
+        /// Return, tab, and newline characters (0xD, 0x9, 0xA) must be substituted with
+        /// a space character, \r\n and \r\u{85} should be replaced by one space in 1.1
+        #[test]
+        fn space_replacement() {
+            let raw_value = "\r\nfoo\u{85}\u{2028}\rbar\tbaz\n\ndelta\n\r\u{85}";
+            let attr = Attribute {
+                key: QName("foo"),
+                value: Cow::Borrowed(raw_value),
+            };
+
+            assert_eq!(
+                attr.normalized_value(Implicit1_0).unwrap(),
+                " foo\u{85}\u{2028} bar baz  delta  \u{85}"
+            );
+            assert_eq!(
+                attr.normalized_value(Explicit1_0).unwrap(),
+                " foo\u{85}\u{2028} bar baz  delta  \u{85}"
+            );
+            assert_eq!(
+                attr.normalized_value(Explicit1_1).unwrap(),
+                " foo   bar baz  delta  "
+            );
+        }
+
+        /// Entities must be terminated
+        #[test]
+        fn unterminated_entity() {
+            let raw_value = "abc&quotdef";
+            let attr = Attribute {
+                key: QName("foo"),
+                value: Cow::Borrowed(raw_value),
+            };
+
+            match attr.normalized_value(Implicit1_0) {
+                Err(Error::Escape(err)) => assert_eq!(err, UnterminatedEntity(3..11)),
+                x => panic!("Expected Err(Escape(_)), got {:?}", x),
+            }
+
+            match attr.normalized_value(Explicit1_0) {
+                Err(Error::Escape(err)) => assert_eq!(err, UnterminatedEntity(3..11)),
+                x => panic!("Expected Err(Escape(_)), got {:?}", x),
+            }
+
+            match attr.normalized_value(Explicit1_1) {
+                Err(Error::Escape(err)) => assert_eq!(err, UnterminatedEntity(3..11)),
+                x => panic!("Expected Err(Escape(_)), got {:?}", x),
+            }
+        }
+
+        /// Unknown entities raise error
+        #[test]
+        fn unrecognized_entity() {
+            let raw_value = "abc&unkn;def";
+            let attr = Attribute {
+                key: QName("foo"),
+                value: Cow::Borrowed(raw_value),
+            };
+
+            match attr.normalized_value(Implicit1_0) {
+                // TODO: is this divergence between range behavior of UnterminatedEntity
+                // and UnrecognizedEntity appropriate? existing unescape code behaves the same.  (see: start index)
+                Err(Error::Escape(err)) => {
+                    assert_eq!(err, UnrecognizedEntity(4..8, "unkn".to_owned()))
+                }
+                x => panic!("Expected Err(Escape(err)), got {:?}", x),
+            }
+            match attr.normalized_value(Explicit1_0) {
+                // TODO: is this divergence between range behavior of UnterminatedEntity
+                // and UnrecognizedEntity appropriate? existing unescape code behaves the same.  (see: start index)
+                Err(Error::Escape(err)) => {
+                    assert_eq!(err, UnrecognizedEntity(4..8, "unkn".to_owned()))
+                }
+                x => panic!("Expected Err(Escape(err)), got {:?}", x),
+            }
+            match attr.normalized_value(Explicit1_1) {
+                // TODO: is this divergence between range behavior of UnterminatedEntity
+                // and UnrecognizedEntity appropriate? existing unescape code behaves the same.  (see: start index)
+                Err(Error::Escape(err)) => {
+                    assert_eq!(err, UnrecognizedEntity(4..8, "unkn".to_owned()))
+                }
+                x => panic!("Expected Err(Escape(err)), got {:?}", x),
+            }
+        }
+
+        /// custom entity replacement works, entity replacement text processed recursively
+        #[test]
+        fn entity_replacement() {
+            let raw_value = "&d;&d;A&a;&#x20;&a;B&da;";
+            let attr = Attribute {
+                key: QName("foo"),
+                value: Cow::Borrowed(raw_value),
+            };
+            fn custom_resolver(ent: &str) -> Option<&'static str> {
+                match ent {
+                    "d" => Some("&#xD;"),
+                    "a" => Some("&#xA;"),
+                    "da" => Some("&#xD;&#xA;"),
+                    _ => None,
+                }
+            }
+
+            assert_eq!(
+                attr.normalized_value_with(Implicit1_0, 5, &custom_resolver)
+                    .unwrap(),
+                "\r\rA\n \nB\r\n"
+            );
+            assert_eq!(
+                attr.normalized_value_with(Explicit1_0, 5, &custom_resolver)
+                    .unwrap(),
+                "\r\rA\n \nB\r\n"
+            );
+            assert_eq!(
+                attr.normalized_value_with(Explicit1_1, 5, &custom_resolver)
+                    .unwrap(),
+                "\r\rA\n \nB\r\n"
+            );
+        }
+
+        #[test]
+        fn char_references() {
+            // character literal references are substituted without being replaced by spaces
+            let raw_value = "&#xd;&#xd;A&#xa;&#xa;B&#xd;&#xa;";
+            let attr = Attribute {
+                key: QName("foo"),
+                value: Cow::Borrowed(raw_value),
+            };
+
+            assert_eq!(
+                attr.normalized_value(Implicit1_0).unwrap(),
+                "\r\rA\n\nB\r\n"
+            );
+            assert_eq!(
+                attr.normalized_value(Explicit1_0).unwrap(),
+                "\r\rA\n\nB\r\n"
+            );
+            assert_eq!(
+                attr.normalized_value(Explicit1_1).unwrap(),
+                "\r\rA\n\nB\r\n"
+            );
+        }
+    }
+
     /// Checked attribute is the single attribute
     mod single {
         use super::*;
@@ -1024,8 +1506,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1040,8 +1522,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1080,8 +1562,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"'key'"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("'key'"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1098,8 +1580,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key&jey"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key&jey"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1131,15 +1613,15 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1154,15 +1636,15 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1180,8 +1662,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1199,8 +1681,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1217,15 +1699,15 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"'key'"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("'key'"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1242,15 +1724,15 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key&jey"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key&jey"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1326,8 +1808,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1342,8 +1824,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1382,8 +1864,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"'key'"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("'key'"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1400,8 +1882,8 @@ mod xml {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key&jey"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key&jey"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1438,16 +1920,16 @@ mod xml {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::Duplicated(16, 4))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -1463,16 +1945,16 @@ mod xml {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::Duplicated(16, 4))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -1488,16 +1970,16 @@ mod xml {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::Duplicated(16, 4))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -1513,20 +1995,54 @@ mod xml {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::ExpectedEq(20))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
                 assert_eq!(iter.next(), None);
+            }
+
+            /// Once a start tag declares more than `SMALL_ATTRIBUTE_COUNT`
+            /// attributes the duplicate check switches to its hash-based path. A
+            /// duplicate of a name first seen during the earlier linear phase must
+            /// still be detected, with the original position reported. Regression
+            /// cover for the cold path of [#969].
+            ///
+            /// [#969]: https://github.com/tafia/quick-xml/issues/969
+            #[test]
+            fn duplicate_past_hash_threshold() {
+                let dup = SMALL_ATTRIBUTE_COUNT / 2;
+                let n = SMALL_ATTRIBUTE_COUNT + 8;
+
+                let mut source = String::from("tag");
+                let mut positions = Vec::with_capacity(n);
+                for i in 0..n {
+                    source.push(' ');
+                    positions.push(source.len());
+                    source.push_str(&format!("k{:04}=''", i));
+                }
+                // Repeat the name first seen at `positions[dup]` (linear phase).
+                source.push(' ');
+                let dup_pos = source.len();
+                source.push_str(&format!("k{:04}=''", dup));
+
+                let mut iter = Attributes::new(&source, 3);
+                for _ in 0..n {
+                    assert!(matches!(iter.next(), Some(Ok(_))));
+                }
+                assert_eq!(
+                    iter.next(),
+                    Some(Err(AttrError::Duplicated(dup_pos, positions[dup])))
+                );
             }
         }
 
@@ -1544,22 +2060,22 @@ mod xml {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"dup"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("dup"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -1575,22 +2091,22 @@ mod xml {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"dup"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("dup"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -1607,16 +2123,16 @@ mod xml {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::UnquotedValue(20))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -1633,16 +2149,16 @@ mod xml {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::ExpectedEq(20))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -1658,29 +2174,29 @@ mod xml {
         assert_eq!(
             iter.next(),
             Some(Ok(Attribute {
-                key: QName(b"a"),
-                value: Cow::Borrowed(b"a"),
+                key: QName("a"),
+                value: Cow::Borrowed("a"),
             }))
         );
         assert_eq!(
             iter.next(),
             Some(Ok(Attribute {
-                key: QName(b"b"),
-                value: Cow::Borrowed(b"b"),
+                key: QName("b"),
+                value: Cow::Borrowed("b"),
             }))
         );
         assert_eq!(
             iter.next(),
             Some(Ok(Attribute {
-                key: QName(b"c"),
-                value: Cow::Borrowed(br#"cc"cc"#),
+                key: QName("c"),
+                value: Cow::Borrowed(r#"cc"cc"#),
             }))
         );
         assert_eq!(
             iter.next(),
             Some(Ok(Attribute {
-                key: QName(b"d"),
-                value: Cow::Borrowed(b"dd'dd"),
+                key: QName("d"),
+                value: Cow::Borrowed("dd'dd"),
             }))
         );
         assert_eq!(iter.next(), None);
@@ -1711,8 +2227,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1727,8 +2243,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1743,8 +2259,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1759,8 +2275,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(&[]),
+                    key: QName("key"),
+                    value: Cow::Borrowed(""),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1777,8 +2293,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"'key'"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("'key'"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1795,8 +2311,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key&jey"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key&jey"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1828,15 +2344,15 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1851,15 +2367,15 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1874,15 +2390,15 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1897,15 +2413,15 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(&[]),
+                    key: QName("key"),
+                    value: Cow::Borrowed(""),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1922,15 +2438,15 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"'key'"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("'key'"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1947,15 +2463,15 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key&jey"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key&jey"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"regular"),
-                    value: Cow::Borrowed(b"attribute"),
+                    key: QName("regular"),
+                    value: Cow::Borrowed("attribute"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1972,8 +2488,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"regular='attribute'"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("regular='attribute'"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -1988,8 +2504,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"regular="),
+                    key: QName("key"),
+                    value: Cow::Borrowed("regular="),
                 }))
             );
             // Because we do not check validity of keys and values during parsing,
@@ -1997,8 +2513,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"'attribute'"),
-                    value: Cow::Borrowed(&[]),
+                    key: QName("'attribute'"),
+                    value: Cow::Borrowed(""),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -2013,8 +2529,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"regular"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("regular"),
                 }))
             );
             // Because we do not check validity of keys and values during parsing,
@@ -2022,8 +2538,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"='attribute'"),
-                    value: Cow::Borrowed(&[]),
+                    key: QName("='attribute'"),
+                    value: Cow::Borrowed(""),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -2039,8 +2555,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"regular"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("regular"),
                 }))
             );
             // Because we do not check validity of keys and values during parsing,
@@ -2048,8 +2564,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"="),
-                    value: Cow::Borrowed(&[]),
+                    key: QName("="),
+                    value: Cow::Borrowed(""),
                 }))
             );
             // Because we do not check validity of keys and values during parsing,
@@ -2057,8 +2573,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"'attribute'"),
-                    value: Cow::Borrowed(&[]),
+                    key: QName("'attribute'"),
+                    value: Cow::Borrowed(""),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -2079,8 +2595,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -2095,8 +2611,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -2111,8 +2627,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -2127,8 +2643,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key"),
-                    value: Cow::Borrowed(&[]),
+                    key: QName("key"),
+                    value: Cow::Borrowed(""),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -2145,8 +2661,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"'key'"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("'key'"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -2163,8 +2679,8 @@ mod html {
             assert_eq!(
                 iter.next(),
                 Some(Ok(Attribute {
-                    key: QName(b"key&jey"),
-                    value: Cow::Borrowed(b"value"),
+                    key: QName("key&jey"),
+                    value: Cow::Borrowed("value"),
                 }))
             );
             assert_eq!(iter.next(), None);
@@ -2201,16 +2717,16 @@ mod html {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::Duplicated(16, 4))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -2226,16 +2742,16 @@ mod html {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::Duplicated(16, 4))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -2251,16 +2767,16 @@ mod html {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::Duplicated(16, 4))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -2276,16 +2792,16 @@ mod html {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(iter.next(), Some(Err(AttrError::Duplicated(16, 4))));
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -2307,22 +2823,22 @@ mod html {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"dup"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("dup"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -2338,22 +2854,22 @@ mod html {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"dup"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("dup"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -2369,22 +2885,22 @@ mod html {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"dup"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("dup"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -2400,22 +2916,22 @@ mod html {
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(b"value"),
+                        key: QName("key"),
+                        value: Cow::Borrowed("value"),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"key"),
-                        value: Cow::Borrowed(&[]),
+                        key: QName("key"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(
                     iter.next(),
                     Some(Ok(Attribute {
-                        key: QName(b"another"),
-                        value: Cow::Borrowed(b""),
+                        key: QName("another"),
+                        value: Cow::Borrowed(""),
                     }))
                 );
                 assert_eq!(iter.next(), None);
@@ -2431,29 +2947,29 @@ mod html {
         assert_eq!(
             iter.next(),
             Some(Ok(Attribute {
-                key: QName(b"a"),
-                value: Cow::Borrowed(b"a"),
+                key: QName("a"),
+                value: Cow::Borrowed("a"),
             }))
         );
         assert_eq!(
             iter.next(),
             Some(Ok(Attribute {
-                key: QName(b"b"),
-                value: Cow::Borrowed(b"b"),
+                key: QName("b"),
+                value: Cow::Borrowed("b"),
             }))
         );
         assert_eq!(
             iter.next(),
             Some(Ok(Attribute {
-                key: QName(b"c"),
-                value: Cow::Borrowed(br#"cc"cc"#),
+                key: QName("c"),
+                value: Cow::Borrowed(r#"cc"cc"#),
             }))
         );
         assert_eq!(
             iter.next(),
             Some(Ok(Attribute {
-                key: QName(b"d"),
-                value: Cow::Borrowed(b"dd'dd"),
+                key: QName("d"),
+                value: Cow::Borrowed("dd'dd"),
             }))
         );
         assert_eq!(iter.next(), None);
