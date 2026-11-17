@@ -129,6 +129,7 @@ fn test_roundtrip_suministro(xml: &str) {
 
     // "La prueba del algodón", as we say in spanish
     let generated_xml = envelope.to_xml();
+    assert!(generated_xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
     let reparsed_envelope: SoapEnvelopeReg<SuministroInformacion> =
         from_str(&generated_xml).expect("valid xml");
     assert_eq!(generated_xml, reparsed_envelope.to_xml(),);
@@ -141,6 +142,7 @@ fn test_roundtrip_consulta(xml: &str) {
 
     // "La prueba del algodón", as we say in spanish
     let generated_xml = envelope.to_xml();
+    assert!(generated_xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
     let reparsed_envelope: SoapEnvelopeConsulta<ConsultaFactuSistemaFacturacion> =
         from_str(&generated_xml).expect("valid xml");
     assert_eq!(generated_xml, reparsed_envelope.to_xml(),);

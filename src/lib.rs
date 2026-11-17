@@ -68,7 +68,7 @@ macro_rules! __build_soap_xml {
         let xml_payload = $record.to_xml();
         let namespaces = $record.soap_envelope_namespaces();
         format!(
-            "<?xml version=\"1.0\"?>\n\
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <soapenv:Envelope {namespaces}><soapenv:Header/><soapenv:Body>\
              {payload}\
              </soapenv:Body></soapenv:Envelope>",

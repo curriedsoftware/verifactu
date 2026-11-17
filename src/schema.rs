@@ -2860,7 +2860,7 @@ pub struct SoapEnvelopeReg<T> {
 
 fn render_soap_envelope(namespaces: &str, payload: &str) -> String {
     format!(
-        "<?xml version=\"1.0\"?>\n\
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <soapenv:Envelope {namespaces}><soapenv:Header/><soapenv:Body>{payload}</soapenv:Body></soapenv:Envelope>",
         namespaces = namespaces,
         payload = payload
