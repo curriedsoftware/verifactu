@@ -47,7 +47,7 @@ fn persona_es(
 
 fn foreign_id(id: &str) -> Result<Identificador, Box<dyn std::error::Error>> {
     Ok(Identificador::IdOtro(IDOtro {
-        codigo_pais: CountryType::DE,
+        codigo_pais: Some(CountryType::DE),
         id_type: PersonaFisicaJuridicaID::NifIva,
         id: id.try_into()?,
     }))
