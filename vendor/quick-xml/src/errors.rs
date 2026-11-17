@@ -1,11 +1,11 @@
 //! Error management module
 
-use crate::encoding::{Decoder, EncodingError};
+use crate::encoding::EncodingError;
 use crate::escape::EscapeError;
 use crate::events::attributes::AttrError;
 use crate::name::{NamespaceError, QName};
 use std::fmt;
-use std::io::Error as IoError;
+use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use std::sync::Arc;
 
 /// An error returned if parsed document does not correspond to the XML grammar,
@@ -17,9 +17,12 @@ pub enum SyntaxError {
     /// The parser started to parse `<!`, but the input ended before it can recognize
     /// anything.
     InvalidBangMarkup,
-    /// The parser started to parse processing instruction or XML declaration (`<?`),
+    /// The parser started to parse processing instruction (`<?`),
     /// but the input ended before the `?>` sequence was found.
-    UnclosedPIOrXmlDecl,
+    UnclosedPI,
+    /// The parser started to parse XML declaration (`<?xml` followed by `\t`, `\r`, `\n`, ` ` or `?`),
+    /// but the input ended before the `?>` sequence was found.
+    UnclosedXmlDecl,
     /// The parser started to parse comment (`<!--`) content, but the input ended
     /// before the `-->` sequence was found.
     UnclosedComment,
@@ -32,14 +35,29 @@ pub enum SyntaxError {
     /// The parser started to parse tag content, but the input ended
     /// before the closing `>` character was found.
     UnclosedTag,
+    /// The parser started to parse tag content and currently inside of a quoted string
+    /// (i.e. in an attribute value), but the input ended before the closing quote was found.
+    ///
+    /// Note, that currently error location will point to a start of a tag (the `<` character)
+    /// instead of a start of an attribute value.
+    UnclosedSingleQuotedAttributeValue,
+    /// The parser started to parse tag content and currently inside of a quoted string
+    /// (i.e. in an attribute value), but the input ended before the closing quote was found.
+    ///
+    /// Note, that currently error location will point to a start of a tag (the `<` character)
+    /// instead of a start of an attribute value.
+    UnclosedDoubleQuotedAttributeValue,
 }
 
 impl fmt::Display for SyntaxError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::InvalidBangMarkup => f.write_str("unknown or missed symbol in markup"),
-            Self::UnclosedPIOrXmlDecl => {
-                f.write_str("processing instruction or xml declaration not closed: `?>` not found before end of input")
+            Self::UnclosedPI => {
+                f.write_str("processing instruction not closed: `?>` not found before end of input")
+            }
+            Self::UnclosedXmlDecl => {
+                f.write_str("XML declaration not closed: `?>` not found before end of input")
             }
             Self::UnclosedComment => {
                 f.write_str("comment not closed: `-->` not found before end of input")
@@ -51,6 +69,12 @@ impl fmt::Display for SyntaxError {
                 f.write_str("CDATA not closed: `]]>` not found before end of input")
             }
             Self::UnclosedTag => f.write_str("tag not closed: `>` not found before end of input"),
+            Self::UnclosedSingleQuotedAttributeValue => {
+                f.write_str("attribute value not closed: `'` not found before end of input")
+            }
+            Self::UnclosedDoubleQuotedAttributeValue => {
+                f.write_str("attribute value not closed: `\"` not found before end of input")
+            }
         }
     }
 }
@@ -79,6 +103,8 @@ pub enum IllFormedError {
     ///
     /// [specification]: https://www.w3.org/TR/xml11/#sec-prolog-dtd
     MissingDeclVersion(Option<String>),
+    /// XML version specified in the declaration neither 1.0 or 1.1.
+    UnknownVersion,
     /// A document type definition (DTD) does not contain a name of a root element.
     ///
     /// According to the [specification], document type definition (`<!DOCTYPE foo>`)
@@ -126,7 +152,14 @@ impl fmt::Display for IllFormedError {
                 f.write_str("an XML declaration does not contain `version` attribute")
             }
             Self::MissingDeclVersion(Some(attr)) => {
-                write!(f, "an XML declaration must start with `version` attribute, but in starts with `{}`", attr)
+                write!(
+                    f,
+                    "an XML declaration must start with `version` attribute, but in starts with `{}`",
+                    attr
+                )
+            }
+            Self::UnknownVersion => {
+                f.write_str("unknown XML version: either 1.0 or 1.1 is expected")
             }
             Self::MissingDoctypeName => {
                 f.write_str("`<!DOCTYPE>` declaration does not contain a name of a document type")
@@ -180,11 +213,8 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn missed_end(name: QName, decoder: Decoder) -> Self {
-        match decoder.decode(name.as_ref()) {
-            Ok(name) => IllFormedError::MissingEndTag(name.into()).into(),
-            Err(err) => err.into(),
-        }
+    pub(crate) fn missed_end(name: QName) -> Self {
+        IllFormedError::MissingEndTag(name.as_ref().to_string()).into()
     }
 }
 
@@ -192,7 +222,13 @@ impl From<IoError> for Error {
     /// Creates a new `Error::Io` from the given error
     #[inline]
     fn from(error: IoError) -> Error {
-        Self::Io(Arc::new(error))
+        match error.kind() {
+            IoErrorKind::InvalidData => match error.downcast::<EncodingError>() {
+                Ok(err) => Self::Encoding(err),
+                Err(err) => Self::Io(Arc::new(err)),
+            },
+            _ => Self::Io(Arc::new(error)),
+        }
     }
 }
 
@@ -217,6 +253,13 @@ impl From<EncodingError> for Error {
     #[inline]
     fn from(error: EncodingError) -> Error {
         Self::Encoding(error)
+    }
+}
+
+impl From<std::str::Utf8Error> for Error {
+    #[inline]
+    fn from(error: std::str::Utf8Error) -> Error {
+        Self::Encoding(EncodingError::Utf8(error))
     }
 }
 
@@ -278,7 +321,6 @@ pub mod serialize {
     //! A module to handle serde (de)serialization errors
 
     use super::*;
-    use crate::utils::write_byte_string;
     use std::borrow::Cow;
     #[cfg(feature = "overlapped-lists")]
     use std::num::NonZeroUsize;
@@ -300,7 +342,7 @@ pub mod serialize {
         /// Deserializer encounter a start tag with a specified name when it is
         /// not expecting. This happens when you try to deserialize a primitive
         /// value (numbers, strings, booleans) from an XML element.
-        UnexpectedStart(Vec<u8>),
+        MixedContent(String),
         /// The [`Reader`] produced [`Event::Eof`] when it is not expecting,
         /// for example, after producing [`Event::Start`] but before corresponding
         /// [`Event::End`].
@@ -310,6 +352,12 @@ pub mod serialize {
         /// [`Event::Start`]: crate::events::Event::Start
         /// [`Event::End`]: crate::events::Event::End
         UnexpectedEof,
+        /// The XML input exceeds the configured recursion limit.
+        ///
+        /// The contained value is the limit that was exceeded. This error is
+        /// returned when deserializing deeply nested XML structures to prevent
+        /// stack overflows.
+        TooDeeplyNested(usize),
         /// Too many events were skipped while deserializing a sequence, event limit
         /// exceeded. The limit was provided as an argument
         #[cfg(feature = "overlapped-lists")]
@@ -322,12 +370,9 @@ pub mod serialize {
                 Self::Custom(s) => f.write_str(s),
                 Self::InvalidXml(e) => e.fmt(f),
                 Self::KeyNotRead => f.write_str("invalid `Deserialize` implementation: `MapAccess::next_value[_seed]` was called before `MapAccess::next_key[_seed]`"),
-                Self::UnexpectedStart(e) => {
-                    f.write_str("unexpected `Event::Start(")?;
-                    write_byte_string(f, e)?;
-                    f.write_str(")`")
-                }
+                Self::MixedContent(e) => write!(f, "cannot deserialize primitive type from mixed content, found unexpected tag <{}>", e),
                 Self::UnexpectedEof => f.write_str("unexpected `Event::Eof`"),
+                Self::TooDeeplyNested(limit) => write!(f, "XML is too deeply nested, recursion limit of {} exceeded", limit),
                 #[cfg(feature = "overlapped-lists")]
                 Self::TooManyEvents(s) => write!(f, "deserializer buffered {} events, limit exceeded", s),
             }
@@ -373,6 +418,13 @@ pub mod serialize {
     impl From<AttrError> for DeError {
         #[inline]
         fn from(e: AttrError) -> Self {
+            Self::InvalidXml(e.into())
+        }
+    }
+
+    impl From<NamespaceError> for DeError {
+        #[inline]
+        fn from(e: NamespaceError) -> Self {
             Self::InvalidXml(e.into())
         }
     }

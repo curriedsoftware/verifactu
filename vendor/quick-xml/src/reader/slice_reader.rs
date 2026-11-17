@@ -2,16 +2,17 @@
 //! underlying byte stream. This implementation supports not using an
 //! intermediate buffer as the byte slice itself can be used to borrow from.
 
-use std::borrow::Cow;
 use std::io;
 
 #[cfg(feature = "encoding")]
+use crate::encoding::DetectedEncoding;
+#[cfg(feature = "encoding")]
 use crate::reader::EncodingRef;
 #[cfg(feature = "encoding")]
-use encoding_rs::{Encoding, UTF_8};
+use encoding_rs;
 
 use crate::errors::{Error, Result};
-use crate::events::Event;
+use crate::events::{BytesText, Event};
 use crate::name::QName;
 use crate::parser::Parser;
 use crate::reader::{BangType, ReadRefResult, ReadTextResult, Reader, Span, XmlSource};
@@ -28,7 +29,7 @@ impl<'a> Reader<&'a [u8]> {
         #[cfg(feature = "encoding")]
         {
             let mut reader = Self::from_reader(s.as_bytes());
-            reader.state.encoding = EncodingRef::Explicit(UTF_8);
+            reader.state.encoding = EncodingRef::Explicit(encoding_rs::UTF_8);
             reader
         }
 
@@ -62,7 +63,7 @@ impl<'a> Reader<&'a [u8]> {
     /// loop {
     ///     match reader.read_event().unwrap() {
     ///         Event::Start(e) => count += 1,
-    ///         Event::Text(e) => txt.push(e.decode().unwrap().into_owned()),
+    ///         Event::Text(e) => txt.push(e.into_inner().into_owned()),
     ///         Event::Eof => break,
     ///         _ => (),
     ///     }
@@ -170,13 +171,11 @@ impl<'a> Reader<&'a [u8]> {
     /// it reads, and if, for example, it contains CDATA section, attempt to
     /// unescape it content will spoil data.
     ///
-    /// Any text will be decoded using the XML current [`decoder()`].
-    ///
     /// Actually, this method perform the following code:
     ///
     /// ```ignore
     /// let span = reader.read_to_end(end)?;
-    /// let text = reader.decoder().decode(&reader.inner_slice[span]);
+    /// let text = &reader.inner_slice[span];
     /// ```
     ///
     /// # Examples
@@ -209,11 +208,12 @@ impl<'a> Reader<&'a [u8]> {
     /// // ...then, we could read text content until close tag.
     /// // This call will correctly handle nested <html> elements.
     /// let text = reader.read_text(end.name()).unwrap();
-    /// assert_eq!(text, Cow::Borrowed(r#"
+    /// let text = text.into_inner();
+    /// assert_eq!(text, r#"
     ///         <title>This is a HTML text</title>
     ///         <p>Usual XML rules does not apply inside it
     ///         <p>For example, elements not needed to be &quot;closed&quot;
-    ///     "#));
+    ///     "#);
     /// assert!(matches!(text, Cow::Borrowed(_)));
     ///
     /// // Now we can enable checks again
@@ -224,8 +224,7 @@ impl<'a> Reader<&'a [u8]> {
     /// ```
     ///
     /// [`Start`]: Event::Start
-    /// [`decoder()`]: Self::decoder()
-    pub fn read_text(&mut self, end: QName) -> Result<Cow<'a, str>> {
+    pub fn read_text(&mut self, end: QName) -> Result<BytesText<'a>> {
         // self.reader will be changed, so store original reference
         let buffer = self.reader;
         let span = self.read_to_end(end)?;
@@ -233,14 +232,21 @@ impl<'a> Reader<&'a [u8]> {
         let len = span.end - span.start;
         // SAFETY: `span` can only contain indexes up to usize::MAX because it
         // was created from offsets from a single &[u8] slice
-        Ok(self.decoder().decode(&buffer[0..len as usize])?)
+        // Could use from_utf8_unchecked: buffer was validated during event parsing
+        let text = std::str::from_utf8(&buffer[0..len as usize])?;
+        Ok(BytesText::wrap(text))
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Implementation of `XmlSource` for `&[u8]` reader using a `Self` as buffer
-/// that will be borrowed by events. This implementation provides a zero-copy deserialization
+/// that will be borrowed by events. This implementation provides a zero-copy deserialization.
+///
+/// Note: When the reader is created via [`Reader::from_str`], the input is
+/// guaranteed to be valid UTF-8. In that case, the `from_utf8` calls below
+/// could safely use `from_utf8_unchecked`. However, `Reader::from_reader`
+/// also instantiates this impl with arbitrary bytes, so we must validate.
 impl<'a> XmlSource<'a, ()> for &'a [u8] {
     #[cfg(not(feature = "encoding"))]
     #[inline]
@@ -253,10 +259,10 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
 
     #[cfg(feature = "encoding")]
     #[inline]
-    fn detect_encoding(&mut self) -> io::Result<Option<&'static Encoding>> {
-        if let Some((enc, bom_len)) = crate::encoding::detect_encoding(self) {
-            *self = &self[bom_len..];
-            return Ok(Some(enc));
+    fn detect_encoding(&mut self) -> io::Result<Option<DetectedEncoding>> {
+        if let Some(detected) = crate::encoding::detect_encoding(self) {
+            *self = &self[detected.bom_len() as usize..];
+            return Ok(Some(detected));
         }
         Ok(None)
     }
@@ -265,65 +271,80 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
     fn read_text(&mut self, _buf: (), position: &mut u64) -> ReadTextResult<'a, ()> {
         // Search for start of markup or an entity or character reference
         match memchr::memchr2(b'<', b'&', self) {
-            Some(0) if self[0] == b'<' => {
-                *self = &self[1..];
-                *position += 1;
-                ReadTextResult::Markup(())
-            }
+            Some(0) if self[0] == b'<' => ReadTextResult::Markup(()),
             // Do not consume `&` because it may be lone and we would be need to
             // return it as part of Text event
             Some(0) => ReadTextResult::Ref(()),
+
             Some(i) if self[i] == b'<' => {
-                let bytes = &self[..i];
-                *self = &self[i + 1..];
-                *position += i as u64 + 1;
-                ReadTextResult::UpToMarkup(bytes)
+                let (bytes, rest) = self.split_at(i);
+                *self = rest;
+                *position += i as u64;
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => ReadTextResult::UpToMarkup(s),
+                    Err(e) => ReadTextResult::Err(e.into()),
+                }
             }
             Some(i) => {
                 let (bytes, rest) = self.split_at(i);
                 *self = rest;
                 *position += i as u64;
-                ReadTextResult::UpToRef(bytes)
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => ReadTextResult::UpToRef(s),
+                    Err(e) => ReadTextResult::Err(e.into()),
+                }
             }
             None => {
                 let bytes = &self[..];
                 *self = &[];
                 *position += bytes.len() as u64;
-                ReadTextResult::UpToEof(bytes)
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => ReadTextResult::UpToEof(s),
+                    Err(e) => ReadTextResult::Err(e.into()),
+                }
             }
         }
     }
 
     #[inline]
     fn read_ref(&mut self, _buf: (), position: &mut u64) -> ReadRefResult<'a> {
-        debug_assert_eq!(
-            self.first(),
-            Some(&b'&'),
-            "`read_ref` must be called at `&`"
+        debug_assert!(
+            self.starts_with(b"&"),
+            "`read_ref` must be called at `&`:\n{:?}",
+            crate::utils::Bytes(self)
         );
         // Search for the end of reference or a start of another reference or a markup
         match memchr::memchr3(b';', b'&', b'<', &self[1..]) {
+            Some(i) if self[i + 1] == b';' => {
+                // +1 for the start `&`
+                // +1 for the end `;`
+                let end = i + 2;
+                let (bytes, rest) = self.split_at(end);
+                *self = rest;
+                *position += end as u64;
+
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => ReadRefResult::Ref(s),
+                    Err(e) => ReadRefResult::Err(e.into()),
+                }
+            }
             // Do not consume `&` because it may be lone and we would be need to
             // return it as part of Text event
-            Some(i) if self[i + 1] == b'&' => {
+            Some(i) => {
+                let is_amp = self[i + 1] == b'&';
                 let (bytes, rest) = self.split_at(i + 1);
                 *self = rest;
                 *position += i as u64 + 1;
 
-                ReadRefResult::UpToRef(bytes)
-            }
-            Some(i) => {
-                let end = i + 1;
-                let is_end = self[end] == b';';
-                let bytes = &self[..end];
-                // +1 -- skip the end `;` or `<`
-                *self = &self[end + 1..];
-                *position += end as u64 + 1;
-
-                if is_end {
-                    ReadRefResult::Ref(bytes)
-                } else {
-                    ReadRefResult::UpToMarkup(bytes)
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => {
+                        if is_amp {
+                            ReadRefResult::UpToRef(s)
+                        } else {
+                            ReadRefResult::UpToMarkup(s)
+                        }
+                    }
+                    Err(e) => ReadRefResult::Err(e.into()),
                 }
             }
             None => {
@@ -331,44 +352,53 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
                 *self = &[];
                 *position += bytes.len() as u64;
 
-                ReadRefResult::UpToEof(bytes)
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => ReadRefResult::UpToEof(s),
+                    Err(e) => ReadRefResult::Err(e.into()),
+                }
             }
         }
     }
 
     #[inline]
-    fn read_with<P>(&mut self, mut parser: P, _buf: (), position: &mut u64) -> Result<&'a [u8]>
+    fn read_with<P>(&mut self, mut parser: P, _buf: (), position: &mut u64) -> Result<&'a str>
     where
         P: Parser,
     {
         if let Some(i) = parser.feed(self) {
-            // +1 for `>` which we do not include
-            *position += i as u64 + 1;
-            let bytes = &self[..i];
-            *self = &self[i + 1..];
-            return Ok(bytes);
+            let used = i + 1; // +1 for `>`
+            *position += used as u64;
+            let (bytes, rest) = self.split_at(used);
+            *self = rest;
+            return Ok(std::str::from_utf8(bytes)?);
         }
 
         *position += self.len() as u64;
-        Err(Error::Syntax(P::eof_error()))
+        Err(Error::Syntax(parser.eof_error(self)))
     }
 
     #[inline]
-    fn read_bang_element(&mut self, _buf: (), position: &mut u64) -> Result<(BangType, &'a [u8])> {
+    fn read_bang_element(&mut self, _buf: (), position: &mut u64) -> Result<(BangType, &'a str)> {
         // Peeked one bang ('!') before being called, so it's guaranteed to
         // start with it.
-        debug_assert_eq!(self[0], b'!');
+        debug_assert!(
+            self.starts_with(b"<!"),
+            "`read_bang_element` must be called at `<!`:\n{:?}",
+            crate::utils::Bytes(self)
+        );
 
-        let mut bang_type = BangType::new(self[1..].first().copied())?;
+        let mut bang_type = BangType::new(self.get(2).copied())?;
 
-        if let Some((bytes, i)) = bang_type.parse(&[], self) {
-            *position += i as u64;
-            *self = &self[i..];
-            return Ok((bang_type, bytes));
+        if let Some(i) = bang_type.feed(&[], self) {
+            let consumed = i + 1; // +1 for `>`
+            *position += consumed as u64;
+            let (bytes, rest) = self.split_at(consumed);
+            *self = rest;
+            return Ok((bang_type, std::str::from_utf8(bytes)?));
         }
 
         *position += self.len() as u64;
-        Err(bang_type.to_err().into())
+        Err(Error::Syntax(bang_type.to_err()))
     }
 
     #[inline]
@@ -384,14 +414,19 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
 
     #[inline]
     fn peek_one(&mut self) -> io::Result<Option<u8>> {
-        Ok(self.first().copied())
+        debug_assert!(
+            self.starts_with(b"<"),
+            "markup must start from '<':\n{:?}",
+            crate::utils::Bytes(self)
+        );
+        Ok(self.get(1).copied())
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::reader::test::check;
     use crate::reader::XmlSource;
+    use crate::reader::test::check;
 
     /// Default buffer constructor just pass the byte array from the test
     fn identity<T>(input: T) -> T {
@@ -401,8 +436,8 @@ mod test {
     check!(
         #[test]
         read_event_impl,
-        read_until_close,
         identity,
+        0,
         ()
     );
 }
