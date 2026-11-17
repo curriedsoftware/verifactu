@@ -25,7 +25,7 @@
 use quick_xml::de::from_str;
 use serde::Deserialize;
 use verifactu::schema::{
-    ConsultaFactuSistemaFacturacion, RegistroFactura, RegistroFacturacionAlta, SiNo,
+    ConsultaFactuSistemaFacturacion, Consultante, RegistroFactura, RegistroFacturacionAlta, SiNo,
     SoapEnvelopeConsulta, SoapEnvelopeReg, SuministroInformacion, TipoFactura,
 };
 
@@ -213,7 +213,10 @@ fn parses_requerimiento_anulacion_example() {
 #[test]
 fn parses_consulta_basica_example() {
     let consulta = parse_consulta(CONSULTA_BASICA);
-    assert!(consulta.cabecera.obligado_emision.is_some());
+    assert!(matches!(
+        consulta.cabecera.consultante,
+        Consultante::ObligadoEmision(_)
+    ));
     let periodo = consulta.filtro_consulta.periodo_imputacion;
     assert_eq!(periodo.ejercicio.as_str(), "2024");
 }
@@ -233,14 +236,17 @@ fn parses_consulta_filtrada_factura_example() {
         .as_ref()
         .and_then(|f| f.rango_fecha_expedicion.as_ref())
         .expect("rango fecha");
-    assert_eq!(rango.desde.as_str(), "02-11-2024");
-    assert_eq!(rango.hasta.as_str(), "13-11-2024");
+    assert_eq!(rango.desde.as_ref().map(|f| f.as_str()), Some("02-11-2024"));
+    assert_eq!(rango.hasta.as_ref().map(|f| f.as_str()), Some("13-11-2024"));
 }
 
 #[test]
 fn parses_consulta_paginada_example() {
     let consulta = parse_consulta(CONSULTA_PAGINADA);
-    assert!(consulta.cabecera.destinatario.is_some());
+    assert!(matches!(
+        consulta.cabecera.consultante,
+        Consultante::Destinatario(_)
+    ));
     assert!(consulta.filtro_consulta.clave_paginacion.is_some());
 }
 
