@@ -40,8 +40,8 @@ use verifactu::{
     errors::DataError,
     hashing::{AltaHuellaInput, AnulacionHuellaInput},
     schema::{
-        Encadenamiento, EstadoRegistroConsulta, Identificador, IndicadorPaginacion,
-        PeriodoImputacion as SchemaPeriodoImputacion, PersonaFisicaJuridicaConsulta,
+        Encadenamiento, EstadoRegistroConsulta, IndicadorPaginacion,
+        PeriodoImputacion as SchemaPeriodoImputacion, PersonaFisicaJuridicaESConsulta,
         RegistroRespuestaConsultaRegFacturacion, RespuestaConsultaLR, ResultadoConsulta, SiNo,
     },
 };
@@ -184,8 +184,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .consulta(&verifactu::schema::ConsultaFactuSistemaFacturacion {
                     cabecera: verifactu::schema::CabeceraConsulta {
                         id_version: "1.0".try_into()?,
-                        obligado_emision: Some(obligado_emision),
-                        destinatario: None,
+                        consultante: verifactu::schema::Consultante::ObligadoEmision(
+                            obligado_emision,
+                        ),
                         indicador_representante: None,
                     },
                     filtro_consulta: filtro.try_into()?,
@@ -221,7 +222,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// every registro has been collected.
 async fn fetch_all_registros(
     client: &verifactu::Client,
-    obligado_emision: PersonaFisicaJuridicaConsulta,
+    obligado_emision: PersonaFisicaJuridicaESConsulta,
     filtro: FiltroConsulta,
 ) -> Result<Vec<RegistroRespuestaConsultaRegFacturacion>, Box<dyn Error>> {
     let base_filtro: verifactu::schema::FiltroConsulta = filtro.try_into()?;
@@ -237,8 +238,9 @@ async fn fetch_all_registros(
             .consulta(&verifactu::schema::ConsultaFactuSistemaFacturacion {
                 cabecera: verifactu::schema::CabeceraConsulta {
                     id_version: "1.0".try_into()?,
-                    obligado_emision: Some(obligado_emision.clone()),
-                    destinatario: None,
+                    consultante: verifactu::schema::Consultante::ObligadoEmision(
+                        obligado_emision.clone(),
+                    ),
                     indicador_representante: None,
                 },
                 filtro_consulta,
@@ -587,21 +589,20 @@ fn read_certificate_pem() -> Result<String, Box<dyn Error>> {
 /// overrides the derived NIF.
 fn build_obligado_emision(
     obligado_nif: Option<String>,
-) -> Result<PersonaFisicaJuridicaConsulta, Box<dyn Error>> {
+) -> Result<PersonaFisicaJuridicaESConsulta, Box<dyn Error>> {
     let cert_pem = read_certificate_pem()?;
     let (nombre_razon, derived_nif) = derive_obligado_from_cert(&cert_pem)?;
     let nif = obligado_nif.unwrap_or(derived_nif);
 
-    Ok(PersonaFisicaJuridicaConsulta {
+    Ok(PersonaFisicaJuridicaESConsulta {
         nombre_razon: nombre_razon
             .as_str()
             .try_into()
             .map_err(|err| format!("invalid NombreRazon derived from certificate: {err}"))?,
-        identificador: Identificador::Nif(
-            nif.as_str()
-                .try_into()
-                .map_err(|err| format!("invalid ObligadoEmision NIF: {err}"))?,
-        ),
+        nif: nif
+            .as_str()
+            .try_into()
+            .map_err(|err| format!("invalid ObligadoEmision NIF: {err}"))?,
     })
 }
 

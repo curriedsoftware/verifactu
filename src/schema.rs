@@ -1058,15 +1058,56 @@ struct PersonaFisicaJuridicaConsultaWire {
         alias = "IDOtro",
         skip_serializing_if = "Option::is_none"
     )]
-    id_otro: Option<IDOtro>,
+    id_otro: Option<IDOtroConsultaWire>,
+}
+
+/// `IDOtro` as the consulta writes it. The consulta envelope binds the
+/// `SuministroInformacion.xsd` namespace to `sum`, not to the `sum1` the
+/// suministro uses, so [`IDOtro`]'s own field names would leave an undeclared
+/// prefix in the document.
+#[derive(Serialize, Deserialize)]
+struct IDOtroConsultaWire {
+    #[serde(rename = "sum:CodigoPais", alias = "CodigoPais")]
+    codigo_pais: CountryType,
+    #[serde(rename = "sum:IDType", alias = "IDType")]
+    id_type: PersonaFisicaJuridicaID,
+    #[serde(rename = "sum:ID", alias = "ID")]
+    id: StringMax20,
+}
+
+impl From<IDOtro> for IDOtroConsultaWire {
+    fn from(value: IDOtro) -> Self {
+        Self {
+            codigo_pais: value.codigo_pais,
+            id_type: value.id_type,
+            id: value.id,
+        }
+    }
+}
+
+impl From<IDOtroConsultaWire> for IDOtro {
+    fn from(value: IDOtroConsultaWire) -> Self {
+        Self {
+            codigo_pais: value.codigo_pais,
+            id_type: value.id_type,
+            id: value.id,
+        }
+    }
+}
+
+/// Splits an `Identificador` into the two optional wire fields of a consulta.
+fn identificador_to_consulta_wire(
+    identificador: &Identificador,
+) -> (Option<NIF>, Option<IDOtroConsultaWire>) {
+    match identificador {
+        Identificador::Nif(nif) => (Some(nif.clone()), None),
+        Identificador::IdOtro(id_otro) => (None, Some(id_otro.clone().into())),
+    }
 }
 
 impl Serialize for PersonaFisicaJuridicaConsulta {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let (nif, id_otro) = match &self.identificador {
-            Identificador::Nif(nif) => (Some(nif.clone()), None),
-            Identificador::IdOtro(id_otro) => (None, Some(id_otro.clone())),
-        };
+        let (nif, id_otro) = identificador_to_consulta_wire(&self.identificador);
         PersonaFisicaJuridicaConsultaWire {
             nombre_razon: self.nombre_razon.clone(),
             nif,
@@ -1084,10 +1125,21 @@ impl<'de> Deserialize<'de> for PersonaFisicaJuridicaConsulta {
             identificador: identificador_from_wire(
                 "PersonaFisicaJuridicaConsulta",
                 wire.nif,
-                wire.id_otro,
+                wire.id_otro.map(Into::into),
             )?,
         })
     }
+}
+
+/// A Spanish party identified by NIF, as the consulta header carries it
+/// (`ObligadoEmisionConsultaType` and `PersonaFisicaJuridicaESType`). Unlike
+/// a `Contraparte`, the party asking cannot be identified by an `IDOtro`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaFisicaJuridicaESConsulta {
+    #[serde(rename = "sum:NombreRazon", alias = "NombreRazon")]
+    pub nombre_razon: StringMax120,
+    #[serde(rename = "sum:NIF", alias = "NIF")]
+    pub nif: NIF,
 }
 
 impl From<PersonaFisicaJuridica> for PersonaFisicaJuridicaConsulta {
@@ -1435,28 +1487,87 @@ impl IntoSoapXml for ConsultaFactuSistemaFacturacion {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Who is asking: the issuer of the records or their recipient. The schema
+/// (`CabeceraConsultaSf`) makes the two a choice, so a header naming both is
+/// unrepresentable.
+#[derive(Debug, Clone)]
+pub enum Consultante {
+    ObligadoEmision(PersonaFisicaJuridicaESConsulta),
+    Destinatario(PersonaFisicaJuridicaESConsulta),
+}
+
+#[derive(Debug, Clone)]
 pub struct CabeceraConsulta {
-    #[serde(rename = "sum:IDVersion", alias = "IDVersion")]
     pub id_version: IDVersion,
+    pub consultante: Consultante,
+    pub indicador_representante: Option<IndicadorRepresentante>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CabeceraConsultaWire {
+    #[serde(rename = "sum:IDVersion", alias = "IDVersion")]
+    id_version: IDVersion,
     #[serde(
         rename = "sum:ObligadoEmision",
         alias = "ObligadoEmision",
         skip_serializing_if = "Option::is_none"
     )]
-    pub obligado_emision: Option<PersonaFisicaJuridicaConsulta>,
+    obligado_emision: Option<PersonaFisicaJuridicaESConsulta>,
     #[serde(
         rename = "sum:Destinatario",
         alias = "Destinatario",
         skip_serializing_if = "Option::is_none"
     )]
-    pub destinatario: Option<PersonaFisicaJuridicaConsulta>,
+    destinatario: Option<PersonaFisicaJuridicaESConsulta>,
     #[serde(
         rename = "sum:IndicadorRepresentante",
         alias = "IndicadorRepresentante",
         skip_serializing_if = "Option::is_none"
     )]
-    pub indicador_representante: Option<IndicadorRepresentante>,
+    indicador_representante: Option<IndicadorRepresentante>,
+}
+
+impl Serialize for CabeceraConsulta {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (obligado_emision, destinatario) = match &self.consultante {
+            Consultante::ObligadoEmision(persona) => (Some(persona.clone()), None),
+            Consultante::Destinatario(persona) => (None, Some(persona.clone())),
+        };
+        CabeceraConsultaWire {
+            id_version: self.id_version,
+            obligado_emision,
+            destinatario,
+            indicador_representante: self.indicador_representante.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CabeceraConsulta {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let wire = CabeceraConsultaWire::deserialize(deserializer)?;
+        let consultante = match (wire.obligado_emision, wire.destinatario) {
+            (Some(persona), None) => Consultante::ObligadoEmision(persona),
+            (None, Some(persona)) => Consultante::Destinatario(persona),
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "CabeceraConsulta cannot have both ObligadoEmision and Destinatario",
+                ));
+            }
+            (None, None) => {
+                return Err(D::Error::custom(
+                    "CabeceraConsulta must have either ObligadoEmision or Destinatario",
+                ));
+            }
+        };
+        Ok(Self {
+            id_version: wire.id_version,
+            consultante,
+            indicador_representante: wire.indicador_representante,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1537,10 +1648,18 @@ pub struct FechaExpedicionFiltro {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangoFechaExpedicion {
-    #[serde(rename = "sum:Desde", alias = "Desde")]
-    pub desde: Fecha,
-    #[serde(rename = "sum:Hasta", alias = "Hasta")]
-    pub hasta: Fecha,
+    #[serde(
+        rename = "sum:Desde",
+        alias = "Desde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub desde: Option<Fecha>,
+    #[serde(
+        rename = "sum:Hasta",
+        alias = "Hasta",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hasta: Option<Fecha>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2219,21 +2338,113 @@ pub struct SistemaInformatico {
     pub indicador_multiples_ot: SiNo,
 }
 
-// Software system information for queries (simplified structure)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The `SistemaInformatico` filter of a consulta
+/// (`SistemaInformaticoConsultaType`): the producer, the system's code and the
+/// installation number are what identify it, the rest narrows the filter.
+#[derive(Debug, Clone)]
 pub struct SistemaInformaticoConsulta {
+    pub nombre_razon: StringMax120,
+    pub identificador: Identificador,
+    pub nombre_sistema_informatico: Option<StringMax30>,
+    pub id_sistema_informatico: StringMax2,
+    pub version: Option<StringMax50>,
+    pub numero_instalacion: StringMax100,
+    pub tipo_uso_posible_solo_verifactu: Option<SiNo>,
+    pub tipo_uso_posible_multi_ot: Option<SiNo>,
+    pub indicador_multiples_ot: Option<SiNo>,
+}
+
+// Field order is the schema's sequence: quick-xml writes fields as declared.
+#[derive(Serialize, Deserialize)]
+struct SistemaInformaticoConsultaWire {
+    #[serde(rename = "sum:NombreRazon", alias = "NombreRazon")]
+    nombre_razon: StringMax120,
+    #[serde(
+        rename = "sum:NIF",
+        alias = "NIF",
+        skip_serializing_if = "Option::is_none"
+    )]
+    nif: Option<NIF>,
+    #[serde(
+        rename = "sum:IDOtro",
+        alias = "IDOtro",
+        skip_serializing_if = "Option::is_none"
+    )]
+    id_otro: Option<IDOtroConsultaWire>,
     #[serde(
         rename = "sum:NombreSistemaInformatico",
         alias = "NombreSistemaInformatico",
         skip_serializing_if = "Option::is_none"
     )]
-    pub nombre_sistema_informatico: Option<StringMax30>,
+    nombre_sistema_informatico: Option<StringMax30>,
+    #[serde(rename = "sum:IdSistemaInformatico", alias = "IdSistemaInformatico")]
+    id_sistema_informatico: StringMax2,
     #[serde(
-        rename = "sum:IdSistemaInformatico",
-        alias = "IdSistemaInformatico",
+        rename = "sum:Version",
+        alias = "Version",
         skip_serializing_if = "Option::is_none"
     )]
-    pub id_sistema_informatico: Option<StringMax2>,
+    version: Option<StringMax50>,
+    #[serde(rename = "sum:NumeroInstalacion", alias = "NumeroInstalacion")]
+    numero_instalacion: StringMax100,
+    #[serde(
+        rename = "sum:TipoUsoPosibleSoloVerifactu",
+        alias = "TipoUsoPosibleSoloVerifactu",
+        skip_serializing_if = "Option::is_none"
+    )]
+    tipo_uso_posible_solo_verifactu: Option<SiNo>,
+    #[serde(
+        rename = "sum:TipoUsoPosibleMultiOT",
+        alias = "TipoUsoPosibleMultiOT",
+        skip_serializing_if = "Option::is_none"
+    )]
+    tipo_uso_posible_multi_ot: Option<SiNo>,
+    #[serde(
+        rename = "sum:IndicadorMultiplesOT",
+        alias = "IndicadorMultiplesOT",
+        skip_serializing_if = "Option::is_none"
+    )]
+    indicador_multiples_ot: Option<SiNo>,
+}
+
+impl Serialize for SistemaInformaticoConsulta {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (nif, id_otro) = identificador_to_consulta_wire(&self.identificador);
+        SistemaInformaticoConsultaWire {
+            nombre_razon: self.nombre_razon.clone(),
+            nif,
+            id_otro,
+            nombre_sistema_informatico: self.nombre_sistema_informatico.clone(),
+            id_sistema_informatico: self.id_sistema_informatico.clone(),
+            version: self.version.clone(),
+            numero_instalacion: self.numero_instalacion.clone(),
+            tipo_uso_posible_solo_verifactu: self.tipo_uso_posible_solo_verifactu.clone(),
+            tipo_uso_posible_multi_ot: self.tipo_uso_posible_multi_ot.clone(),
+            indicador_multiples_ot: self.indicador_multiples_ot.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SistemaInformaticoConsulta {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = SistemaInformaticoConsultaWire::deserialize(deserializer)?;
+        Ok(Self {
+            nombre_razon: wire.nombre_razon,
+            identificador: identificador_from_wire(
+                "SistemaInformaticoConsulta",
+                wire.nif,
+                wire.id_otro.map(Into::into),
+            )?,
+            nombre_sistema_informatico: wire.nombre_sistema_informatico,
+            id_sistema_informatico: wire.id_sistema_informatico,
+            version: wire.version,
+            numero_instalacion: wire.numero_instalacion,
+            tipo_uso_posible_solo_verifactu: wire.tipo_uso_posible_solo_verifactu,
+            tipo_uso_posible_multi_ot: wire.tipo_uso_posible_multi_ot,
+            indicador_multiples_ot: wire.indicador_multiples_ot,
+        })
+    }
 }
 
 // Tax breakdown structure
