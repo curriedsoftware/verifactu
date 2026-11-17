@@ -138,6 +138,88 @@ macro_rules! impl_string_type {
     };
 }
 
+/// A closed XSD enumeration: one variant per `<enumeration value="..."/>`,
+/// exchanged as that literal value. A value outside the enumeration cannot be
+/// built, and is refused when read.
+macro_rules! xsd_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            $($(#[$variant_meta:meta])* $variant:ident => $value:literal),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant),+
+        }
+
+        impl $name {
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = ValidationError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                match value {
+                    $($value => Ok(Self::$variant),)+
+                    other => Err(ValidationError::new(
+                        stringify!($name),
+                        format!(
+                            "expected one of {}, got {other:?}",
+                            [$($value),+].join(", ")
+                        ),
+                    )),
+                }
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = ValidationError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::try_from(value.as_str())
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::try_from(value.as_str()).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
 /// A value that enters the huella must carry no leading or trailing
 /// whitespace: the hash trims it (AEAT huella specification v0.1.2) but the
 /// XML sends it as given, so a padded value would identify one invoice at the
@@ -457,8 +539,209 @@ fn is_valid_calendar_date(year: i32, month: u32, day: u32) -> bool {
     day != 0 && day <= max_day
 }
 
-// `NumSerieFactura` is a huella field.
+// `RegistroAnterior/NumSerieFactura` (a huella field) is `TextMax60Type` in the
+// XSD; every other `NumSerieFactura` is the stricter [`TextoIDFactura`].
 string_max_type!(TextMax60, 60, hashed);
+
+/// `NumSerieFactura` (`TextoIDFacturaType`): 1 to 60 characters. On top of the
+/// XSD, the AEAT refuses (error 1104) any character outside printable ASCII
+/// (32 to 126) and the five characters `"`, `'`, `<`, `>` and `=`. It is a
+/// huella field, so it cannot start or end with whitespace either.
+///
+/// A value read from XML is only held to the maximum length, so a record
+/// another system sent stays readable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TextoIDFactura(String);
+
+impl TextoIDFactura {
+    const MAX_LEN: usize = 60;
+    const FORBIDDEN: [char; 5] = ['"', '\'', '<', '>', '='];
+
+    fn validate(value: &str) -> Result<(), ValidationError> {
+        if value.is_empty() {
+            return Err(ValidationError::new(
+                "TextoIDFactura",
+                "value cannot be empty",
+            ));
+        }
+        Self::validate_len(value)?;
+        if let Some(invalid) = value
+            .chars()
+            .find(|c| !matches!(c, ' '..='~') || Self::FORBIDDEN.contains(c))
+        {
+            return Err(ValidationError::new(
+                "TextoIDFactura",
+                format!(
+                    "can only contain printable ASCII characters other than \" ' < > =, got {invalid:?}"
+                ),
+            ));
+        }
+        validate_no_outer_whitespace(value, "TextoIDFactura")
+    }
+
+    fn validate_len(value: &str) -> Result<(), ValidationError> {
+        let len = value.chars().count();
+        if len > Self::MAX_LEN {
+            return Err(ValidationError::new(
+                "TextoIDFactura",
+                format!(
+                    "must contain at most {} characters, got {}",
+                    Self::MAX_LEN,
+                    len
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl_string_type!(TextoIDFactura, TextoIDFactura::validate_len);
+
+/// The pieces of an `xs:dateTime` literal that the two levels of strictness
+/// of [`FechaHoraHuso`] tell apart.
+struct XsdDateTime {
+    year_digits: usize,
+    negative_year: bool,
+    has_fraction: bool,
+    has_timezone: bool,
+}
+
+/// Parses the lexical form of `xs:dateTime`:
+/// `-?YYYY-MM-DDThh:mm:ss(.s+)?(Z|(+|-)hh:mm)?`.
+fn parse_xsd_date_time(value: &str) -> Option<XsdDateTime> {
+    fn two_digits(bytes: &[u8]) -> Option<u32> {
+        match bytes {
+            [a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
+                Some(u32::from(a - b'0') * 10 + u32::from(b - b'0'))
+            }
+            _ => None,
+        }
+    }
+
+    if !value.is_ascii() {
+        return None;
+    }
+    let (negative_year, rest) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    let (date, time) = rest.split_once('T')?;
+
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?;
+    let month = two_digits(date_parts.next()?.as_bytes())?;
+    let day = two_digits(date_parts.next()?.as_bytes())?;
+    if date_parts.next().is_some() || year.len() < 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !is_valid_calendar_date(year.parse().ok()?, month, day) {
+        return None;
+    }
+
+    let time = time.as_bytes();
+    if time.len() < 8 || time[2] != b':' || time[5] != b':' {
+        return None;
+    }
+    let hour = two_digits(&time[0..2])?;
+    let minute = two_digits(&time[3..5])?;
+    let second = two_digits(&time[6..8])?;
+    let end_of_day = hour == 24 && minute == 0 && second == 0;
+    if !(end_of_day || (hour <= 23 && minute <= 59 && second <= 59)) {
+        return None;
+    }
+
+    let mut rest = &time[8..];
+    let mut has_fraction = false;
+    if let [b'.', fraction @ ..] = rest {
+        let digits = fraction.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        if end_of_day && fraction[..digits].iter().any(|b| *b != b'0') {
+            return None;
+        }
+        has_fraction = true;
+        rest = &fraction[digits..];
+    }
+
+    let has_timezone = match rest {
+        [] => false,
+        [b'Z'] => true,
+        [b'+' | b'-', offset @ ..] if offset.len() == 5 && offset[2] == b':' => {
+            let offset_hour = two_digits(&offset[0..2])?;
+            let offset_minute = two_digits(&offset[3..5])?;
+            if !(offset_hour < 14 && offset_minute <= 59 || offset_hour == 14 && offset_minute == 0)
+            {
+                return None;
+            }
+            true
+        }
+        _ => return None,
+    };
+
+    Some(XsdDateTime {
+        year_digits: year.len(),
+        negative_year,
+        has_fraction,
+        has_timezone,
+    })
+}
+
+/// `FechaHoraHusoGenRegistro`: the moment a record was generated, with its
+/// time zone. The XSD type is `xs:dateTime` and the AEAT documents the format
+/// `YYYY-MM-DDThh:mm:ssTZD` (ISO 8601, for example
+/// `2024-01-01T19:20:30+01:00`); anything else is error 1244.
+///
+/// The value is kept as the exact string it was built from or read as, because
+/// that string is what the huella hashes and what the XML sends: it is never
+/// reformatted.
+///
+/// Building one requires whole seconds and an explicit time zone (`Z` or
+/// `+hh:mm` / `-hh:mm`). A value read from XML is held to `xs:dateTime` only,
+/// so fractional seconds or a missing time zone in a response stay readable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FechaHoraHuso(String);
+
+impl FechaHoraHuso {
+    /// Formats `date_time` once, to whole seconds and with its numeric offset
+    /// (`2024-01-01T19:20:30+01:00`).
+    pub fn from_datetime<Tz>(date_time: &chrono::DateTime<Tz>) -> Result<Self, ValidationError>
+    where
+        Tz: chrono::TimeZone,
+        Tz::Offset: fmt::Display,
+    {
+        Self::try_from(date_time.format("%Y-%m-%dT%H:%M:%S%:z").to_string())
+    }
+
+    fn validate(value: &str) -> Result<(), ValidationError> {
+        match parse_xsd_date_time(value) {
+            Some(parsed)
+                if parsed.year_digits == 4
+                    && !parsed.negative_year
+                    && !parsed.has_fraction
+                    && parsed.has_timezone =>
+            {
+                Ok(())
+            }
+            _ => Err(ValidationError::new(
+                "FechaHoraHuso",
+                "must follow the YYYY-MM-DDThh:mm:ssTZD format, where TZD is Z, +hh:mm or -hh:mm",
+            )),
+        }
+    }
+
+    fn validate_received(value: &str) -> Result<(), ValidationError> {
+        match parse_xsd_date_time(value) {
+            Some(_) => Ok(()),
+            None => Err(ValidationError::new(
+                "FechaHoraHuso",
+                "must be a valid xs:dateTime",
+            )),
+        }
+    }
+}
+
+impl_string_type!(FechaHoraHuso, FechaHoraHuso::validate_received);
 string_max_type!(TextMax500, 500);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -486,46 +769,45 @@ impl Year4 {
 
 impl_string_type!(Year4);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct IdOperacionesTrascendenciaTributaria(String);
-
-impl IdOperacionesTrascendenciaTributaria {
-    fn validate(value: &str) -> Result<(), ValidationError> {
-        let len = value.chars().count();
-        if len == 0 {
-            return Err(ValidationError::new(
-                "IdOperacionesTrascendenciaTributaria",
-                "value cannot be empty",
-            ));
-        }
-
-        if len > 4 {
-            return Err(ValidationError::new(
-                "IdOperacionesTrascendenciaTributaria",
-                "value must contain at most 4 characters",
-            ));
-        }
-
-        if !value
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        {
-            return Err(ValidationError::new(
-                "IdOperacionesTrascendenciaTributaria",
-                "value must be composed of uppercase letters and digits",
-            ));
-        }
-
-        Ok(())
+xsd_enum! {
+    /// `ClaveRegimen` (`IdOperacionesTrascendenciaTributariaType`): the VAT or
+    /// IGIC regime of a breakdown line. The codes are those of lists L8A and
+    /// L8B of the AEAT specification; 12, 13 and 16 are not part of the
+    /// enumeration.
+    IdOperacionesTrascendenciaTributaria {
+        C01 => "01",
+        C02 => "02",
+        C03 => "03",
+        C04 => "04",
+        C05 => "05",
+        C06 => "06",
+        C07 => "07",
+        C08 => "08",
+        C09 => "09",
+        C10 => "10",
+        C11 => "11",
+        C14 => "14",
+        C15 => "15",
+        C17 => "17",
+        C18 => "18",
+        C19 => "19",
+        C20 => "20",
+        C21 => "21",
     }
 }
 
-impl_string_type!(IdOperacionesTrascendenciaTributaria);
+xsd_enum! {
+    /// `IDVersion` (`VersionType`): the version of the record format.
+    IDVersion {
+        V1_0 => "1.0",
+    }
+}
 
-// Custom NIF/NIE type that keeps the literal value as provided by AEAT.
-// Official identifiers are 9 characters long, but the public examples use
-// placeholders such as "AAAA", so we keep the payload flexible and let
-// downstream validation enforce the length when required.
+/// A Spanish NIF (`NIFType`): exactly 9 characters.
+///
+/// A value read from XML is kept as received, whatever its length: the AEAT's
+/// public examples use placeholders such as "AAAA", and a response must stay
+/// readable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NIF(String);
 
@@ -535,12 +817,12 @@ impl NIF {
     }
 
     fn validate(value: &str) -> Result<(), ValidationError> {
-        // NIF format is enforced server-side by AEAT, and the public examples
-        // use placeholders such as "AAAA", so we only reject the empty string
-        // here. Validation strictness is deliberately independent of the target
-        // environment (test vs. production), which is now a runtime concern.
-        if value.is_empty() {
-            return Err(ValidationError::new("NIF", "cannot be empty"));
+        let len = value.chars().count();
+        if len != 9 {
+            return Err(ValidationError::new(
+                "NIF",
+                format!("must contain exactly 9 characters, got {len}"),
+            ));
         }
         // `IDEmisorFactura` is a huella field.
         validate_no_outer_whitespace(value, "NIF")
@@ -661,14 +943,55 @@ fn identificador_from_wire<E: serde::de::Error>(
     }
 }
 
-#[derive(Debug, Clone)]
+/// A Spanish person or company, identified by NIF only
+/// (`PersonaFisicaJuridicaESType`): the `ObligadoEmision` and `Representante`
+/// of a `Cabecera`. A foreign identifier (`IDOtro`) is not representable.
+#[derive(Debug, Clone, Serialize)]
 pub struct PersonaFisicaJuridicaES {
+    #[serde(rename = "sum1:NombreRazon")]
+    pub nombre_razon: StringMax120,
+    #[serde(rename = "sum1:NIF")]
+    pub nif: NIF,
+}
+
+impl<'de> Deserialize<'de> for PersonaFisicaJuridicaES {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "sum1:NombreRazon", alias = "NombreRazon")]
+            nombre_razon: StringMax120,
+            #[serde(rename = "sum1:NIF", alias = "NIF")]
+            nif: Option<NIF>,
+            #[serde(rename = "sum1:IDOtro", alias = "IDOtro")]
+            id_otro: Option<serde::de::IgnoredAny>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.id_otro.is_some() {
+            return Err(D::Error::custom(
+                "PersonaFisicaJuridicaES cannot have an IDOtro",
+            ));
+        }
+        Ok(Self {
+            nombre_razon: wire.nombre_razon,
+            nif: wire
+                .nif
+                .ok_or_else(|| D::Error::custom("PersonaFisicaJuridicaES must have a NIF"))?,
+        })
+    }
+}
+
+/// A person or company identified by a NIF or by a foreign identifier
+/// (`PersonaFisicaJuridicaType`): the `Tercero` of an alta and the `Generador`
+/// of an anulación.
+#[derive(Debug, Clone)]
+pub struct PersonaFisicaJuridica {
     pub nombre_razon: StringMax120,
     pub identificador: Identificador,
 }
 
 #[derive(Serialize, Deserialize)]
-struct PersonaFisicaJuridicaESWire {
+struct PersonaFisicaJuridicaWire {
     #[serde(rename = "sum1:NombreRazon", alias = "NombreRazon")]
     nombre_razon: StringMax120,
     #[serde(
@@ -685,13 +1008,13 @@ struct PersonaFisicaJuridicaESWire {
     id_otro: Option<IDOtro>,
 }
 
-impl Serialize for PersonaFisicaJuridicaES {
+impl Serialize for PersonaFisicaJuridica {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let (nif, id_otro) = match &self.identificador {
             Identificador::Nif(nif) => (Some(nif.clone()), None),
             Identificador::IdOtro(id_otro) => (None, Some(id_otro.clone())),
         };
-        PersonaFisicaJuridicaESWire {
+        PersonaFisicaJuridicaWire {
             nombre_razon: self.nombre_razon.clone(),
             nif,
             id_otro,
@@ -700,13 +1023,13 @@ impl Serialize for PersonaFisicaJuridicaES {
     }
 }
 
-impl<'de> Deserialize<'de> for PersonaFisicaJuridicaES {
+impl<'de> Deserialize<'de> for PersonaFisicaJuridica {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = PersonaFisicaJuridicaESWire::deserialize(deserializer)?;
+        let wire = PersonaFisicaJuridicaWire::deserialize(deserializer)?;
         Ok(Self {
             nombre_razon: wire.nombre_razon,
             identificador: identificador_from_wire(
-                "PersonaFisicaJuridicaES",
+                "PersonaFisicaJuridica",
                 wire.nif,
                 wire.id_otro,
             )?,
@@ -767,8 +1090,8 @@ impl<'de> Deserialize<'de> for PersonaFisicaJuridicaConsulta {
     }
 }
 
-impl From<PersonaFisicaJuridicaES> for PersonaFisicaJuridicaConsulta {
-    fn from(value: PersonaFisicaJuridicaES) -> Self {
+impl From<PersonaFisicaJuridica> for PersonaFisicaJuridicaConsulta {
+    fn from(value: PersonaFisicaJuridica) -> Self {
         Self {
             nombre_razon: value.nombre_razon,
             identificador: value.identificador,
@@ -776,7 +1099,16 @@ impl From<PersonaFisicaJuridicaES> for PersonaFisicaJuridicaConsulta {
     }
 }
 
-impl From<PersonaFisicaJuridicaConsulta> for PersonaFisicaJuridicaES {
+impl From<PersonaFisicaJuridicaES> for PersonaFisicaJuridicaConsulta {
+    fn from(value: PersonaFisicaJuridicaES) -> Self {
+        Self {
+            nombre_razon: value.nombre_razon,
+            identificador: Identificador::Nif(value.nif),
+        }
+    }
+}
+
+impl From<PersonaFisicaJuridicaConsulta> for PersonaFisicaJuridica {
     fn from(value: PersonaFisicaJuridicaConsulta) -> Self {
         Self {
             nombre_razon: value.nombre_razon,
@@ -1106,7 +1438,7 @@ impl IntoSoapXml for ConsultaFactuSistemaFacturacion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CabeceraConsulta {
     #[serde(rename = "sum:IDVersion", alias = "IDVersion")]
-    pub id_version: StringMax16,
+    pub id_version: IDVersion,
     #[serde(
         rename = "sum:ObligadoEmision",
         alias = "ObligadoEmision",
@@ -1152,7 +1484,7 @@ pub struct FiltroConsulta {
         alias = "NumSerieFactura",
         skip_serializing_if = "Option::is_none"
     )]
-    pub num_serie_factura: Option<TextMax60>,
+    pub num_serie_factura: Option<TextoIDFactura>,
     #[serde(
         rename = "con:Contraparte",
         alias = "Contraparte",
@@ -1224,7 +1556,7 @@ pub struct ClavePaginacion {
         alias = "NumSerieFactura",
         skip_serializing_if = "Option::is_none"
     )]
-    pub num_serie_factura: Option<TextMax60>,
+    pub num_serie_factura: Option<TextoIDFactura>,
     #[serde(
         rename = "sum:FechaExpedicionFactura",
         alias = "FechaExpedicionFactura",
@@ -1667,11 +1999,27 @@ pub enum TipoRectificativa {
     I, // Incremental
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SiNo {
-    S,
-    N,
-    X,
+xsd_enum! {
+    /// A yes/no flag (`SiNoType` and the other two-valued S/N types of the
+    /// XSD).
+    SiNo {
+        S => "S",
+        N => "N",
+    }
+}
+
+xsd_enum! {
+    /// `RechazoPrevio` of an alta (`RechazoPrevioType`). The anulación's
+    /// `RechazoPrevio` is a plain [`SiNo`]: it has no `X`.
+    RechazoPrevio {
+        /// No previous rejection.
+        N => "N",
+        /// The record was rejected before and is sent again.
+        S => "S",
+        /// The record was never accepted: there is no previous record of it at
+        /// the AEAT. Only valid together with `Subsanacion = S`.
+        X => "X",
+    }
 }
 
 // Additional supporting types
@@ -1681,7 +2029,7 @@ pub struct IDFactura {
     #[serde(rename = "sum1:IDEmisorFactura", alias = "IDEmisorFactura")]
     pub id_emisor_factura: NIF,
     #[serde(rename = "sum1:NumSerieFactura", alias = "NumSerieFactura")]
-    pub num_serie_factura: TextMax60,
+    pub num_serie_factura: TextoIDFactura,
     #[serde(
         rename = "sum1:FechaExpedicionFactura",
         alias = "FechaExpedicionFactura"
@@ -1694,7 +2042,7 @@ pub struct IDFacturaConsulta {
     #[serde(rename = "sum:IDEmisorFactura", alias = "IDEmisorFactura")]
     pub id_emisor_factura: NIF,
     #[serde(rename = "sum:NumSerieFactura", alias = "NumSerieFactura")]
-    pub num_serie_factura: TextMax60,
+    pub num_serie_factura: TextoIDFactura,
     #[serde(
         rename = "sum:FechaExpedicionFactura",
         alias = "FechaExpedicionFactura"
@@ -1733,7 +2081,7 @@ pub struct IDFacturaAnulada {
         rename = "sum1:NumSerieFacturaAnulada",
         alias = "NumSerieFacturaAnulada"
     )]
-    pub num_serie_factura_anulada: TextMax60,
+    pub num_serie_factura_anulada: TextoIDFactura,
     #[serde(
         rename = "sum1:FechaExpedicionFacturaAnulada",
         alias = "FechaExpedicionFacturaAnulada"
@@ -2124,7 +2472,7 @@ mod facturas_sustituidas_serde {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistroFacturacionAlta {
     #[serde(rename = "sum1:IDVersion", alias = "IDVersion")]
-    pub id_version: StringMax16,
+    pub id_version: IDVersion,
     #[serde(rename = "sum1:IDFactura", alias = "IDFactura")]
     pub id_factura: IDFactura,
     #[serde(
@@ -2146,7 +2494,7 @@ pub struct RegistroFacturacionAlta {
         alias = "RechazoPrevio",
         skip_serializing_if = "Option::is_none"
     )]
-    pub rechazo_previo: Option<SiNo>,
+    pub rechazo_previo: Option<RechazoPrevio>,
     #[serde(rename = "sum1:TipoFactura", alias = "TipoFactura")]
     pub tipo_factura: TipoFactura,
     #[serde(
@@ -2220,7 +2568,7 @@ pub struct RegistroFacturacionAlta {
         alias = "Tercero",
         skip_serializing_if = "Option::is_none"
     )]
-    pub tercero: Option<PersonaFisicaJuridicaES>,
+    pub tercero: Option<PersonaFisicaJuridica>,
     #[serde(
         rename = "sum1:Destinatarios",
         alias = "Destinatarios",
@@ -2238,7 +2586,7 @@ pub struct RegistroFacturacionAlta {
     #[serde(rename = "sum1:CuotaTotal", alias = "CuotaTotal")]
     pub cuota_total: ImporteSgn12_2,
     #[serde(rename = "sum1:ImporteTotal", alias = "ImporteTotal")]
-    pub importe_total: ImporteSgn14_2,
+    pub importe_total: ImporteSgn12_2,
     #[serde(rename = "sum1:Encadenamiento", alias = "Encadenamiento")]
     pub encadenamiento: Encadenamiento,
     #[serde(rename = "sum1:SistemaInformatico", alias = "SistemaInformatico")]
@@ -2247,7 +2595,7 @@ pub struct RegistroFacturacionAlta {
         rename = "sum1:FechaHoraHusoGenRegistro",
         alias = "FechaHoraHusoGenRegistro"
     )]
-    pub fecha_hora_huso_gen_registro: String, // DateTime with timezone
+    pub fecha_hora_huso_gen_registro: FechaHoraHuso,
     #[serde(
         rename = "sum1:NumRegistroAcuerdoFacturacion",
         alias = "NumRegistroAcuerdoFacturacion",
@@ -2269,14 +2617,6 @@ pub struct RegistroFacturacionAlta {
 impl RegistroFacturacionAlta {
     /// Validates XSD constraints for this record
     pub fn validate(&self) -> Result<(), ValidationError> {
-        // Validate IDVersion is "1.0"
-        if self.id_version.as_str() != "1.0" {
-            return Err(ValidationError::new(
-                "RegistroFacturacionAlta",
-                format!("IDVersion must be '1.0', got '{}'", self.id_version),
-            ));
-        }
-
         // Validate facturas_rectificadas length
         if let Some(ref facturas) = self.facturas_rectificadas
             && facturas.len() > 1000
@@ -2434,7 +2774,7 @@ impl RegistroFacturacionAlta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistroFacturacionAnulacion {
     #[serde(rename = "sum1:IDVersion", alias = "IDVersion")]
-    pub id_version: StringMax16,
+    pub id_version: IDVersion,
     #[serde(rename = "sum1:IDFactura", alias = "IDFactura")]
     pub id_factura: IDFacturaAnulada,
     #[serde(
@@ -2466,7 +2806,7 @@ pub struct RegistroFacturacionAnulacion {
         alias = "Generador",
         skip_serializing_if = "Option::is_none"
     )]
-    pub generador: Option<PersonaFisicaJuridicaES>,
+    pub generador: Option<PersonaFisicaJuridica>,
     #[serde(rename = "sum1:Encadenamiento", alias = "Encadenamiento")]
     pub encadenamiento: Encadenamiento,
     #[serde(rename = "sum1:SistemaInformatico", alias = "SistemaInformatico")]
@@ -2475,7 +2815,7 @@ pub struct RegistroFacturacionAnulacion {
         rename = "sum1:FechaHoraHusoGenRegistro",
         alias = "FechaHoraHusoGenRegistro"
     )]
-    pub fecha_hora_huso_gen_registro: String, // DateTime with timezone
+    pub fecha_hora_huso_gen_registro: FechaHoraHuso,
     #[serde(rename = "sum1:TipoHuella", alias = "TipoHuella")]
     pub tipo_huella: TipoHuella,
     #[serde(rename = "sum1:Huella", alias = "Huella")]
@@ -2484,15 +2824,10 @@ pub struct RegistroFacturacionAnulacion {
 }
 
 impl RegistroFacturacionAnulacion {
-    /// Validates XSD constraints for this cancellation record
+    /// Validates XSD constraints for this cancellation record. Everything the
+    /// XSD constrains on an anulación is enforced by the field types, so there
+    /// is nothing left to check here today.
     pub fn validate(&self) -> Result<(), ValidationError> {
-        // Validate IDVersion is "1.0"
-        if self.id_version.as_str() != "1.0" {
-            return Err(ValidationError::new(
-                "RegistroFacturacionAnulacion",
-                format!("IDVersion must be '1.0', got '{}'", self.id_version),
-            ));
-        }
         Ok(())
     }
 }
@@ -2636,7 +2971,7 @@ pub struct OperacionRespuesta {
     #[serde(rename = "Subsanacion", skip_serializing_if = "Option::is_none")]
     pub subsanacion: Option<SiNo>,
     #[serde(rename = "RechazoPrevio", skip_serializing_if = "Option::is_none")]
-    pub rechazo_previo: Option<SiNo>,
+    pub rechazo_previo: Option<RechazoPrevio>,
     #[serde(rename = "SinRegistroPrevio", skip_serializing_if = "Option::is_none")]
     pub sin_registro_previo: Option<SiNo>,
 }
@@ -2757,7 +3092,7 @@ pub struct RespuestaDatosRegistroFacturacion {
     #[serde(rename = "Subsanacion", skip_serializing_if = "Option::is_none")]
     pub subsanacion: Option<SiNo>,
     #[serde(rename = "RechazoPrevio", skip_serializing_if = "Option::is_none")]
-    pub rechazo_previo: Option<SiNo>,
+    pub rechazo_previo: Option<RechazoPrevio>,
     #[serde(rename = "SinRegistroPrevio", skip_serializing_if = "Option::is_none")]
     pub sin_registro_previo: Option<SiNo>,
     #[serde(rename = "GeneradoPor", skip_serializing_if = "Option::is_none")]
@@ -2818,7 +3153,7 @@ pub struct RespuestaDatosRegistroFacturacion {
     #[serde(rename = "CuotaTotal", skip_serializing_if = "Option::is_none")]
     pub cuota_total: Option<ImporteSgn12_2>,
     #[serde(rename = "ImporteTotal", skip_serializing_if = "Option::is_none")]
-    pub importe_total: Option<ImporteSgn14_2>,
+    pub importe_total: Option<ImporteSgn12_2>,
     #[serde(rename = "Encadenamiento", skip_serializing_if = "Option::is_none")]
     pub encadenamiento: Option<Encadenamiento>,
     #[serde(rename = "SistemaInformatico", skip_serializing_if = "Option::is_none")]
@@ -2827,7 +3162,7 @@ pub struct RespuestaDatosRegistroFacturacion {
         rename = "FechaHoraHusoGenRegistro",
         skip_serializing_if = "Option::is_none"
     )]
-    pub fecha_hora_huso_gen_registro: Option<String>, // dateTime with timezone
+    pub fecha_hora_huso_gen_registro: Option<FechaHoraHuso>,
     #[serde(
         rename = "NumRegistroAcuerdoFacturacion",
         skip_serializing_if = "Option::is_none"
@@ -3054,7 +3389,7 @@ mod registro_alta_validation_tests {
             importe_total: "121.00".try_into().unwrap(),
             encadenamiento: Encadenamiento::PrimerRegistro,
             sistema_informatico: sample_sistema_informatico(),
-            fecha_hora_huso_gen_registro: "2025-03-15T10:00:00+01:00".to_string(),
+            fecha_hora_huso_gen_registro: "2025-03-15T10:00:00+01:00".try_into().unwrap(),
             num_registro_acuerdo_facturacion: None,
             id_acuerdo_sistema_informatico: None,
             tipo_huella: TipoHuella::Sha256,
@@ -3252,7 +3587,7 @@ mod edge_case_tests {
             importe_total: "121.00".try_into().unwrap(),
             encadenamiento: Encadenamiento::PrimerRegistro,
             sistema_informatico: sistema_informatico(),
-            fecha_hora_huso_gen_registro: "2025-03-15T10:00:00+01:00".to_string(),
+            fecha_hora_huso_gen_registro: "2025-03-15T10:00:00+01:00".try_into().unwrap(),
             num_registro_acuerdo_facturacion: None,
             id_acuerdo_sistema_informatico: None,
             tipo_huella: TipoHuella::Sha256,
@@ -3275,7 +3610,7 @@ mod edge_case_tests {
             generador: None,
             encadenamiento: Encadenamiento::PrimerRegistro,
             sistema_informatico: sistema_informatico(),
-            fecha_hora_huso_gen_registro: "2025-03-15T11:00:00+01:00".to_string(),
+            fecha_hora_huso_gen_registro: "2025-03-15T11:00:00+01:00".try_into().unwrap(),
             tipo_huella: TipoHuella::Sha256,
             huella: "".try_into().unwrap(),
         }
@@ -3285,7 +3620,7 @@ mod edge_case_tests {
         Cabecera {
             obligado_emision: PersonaFisicaJuridicaES {
                 nombre_razon: "Emisor SL".try_into().unwrap(),
-                identificador: Identificador::Nif("B12345678".try_into().unwrap()),
+                nif: "B12345678".try_into().unwrap(),
             },
             representante: None,
             remision_voluntaria: Some(RemisionVoluntaria {
@@ -3506,7 +3841,7 @@ mod edge_case_tests {
                 num_serie_factura_anulada: "12345678/G33".try_into().unwrap(),
                 fecha_expedicion_factura_anulada: "01-01-2024".try_into().unwrap(),
             },
-            fecha_hora_huso_gen_registro: "2024-01-03T19:20:30+01:00".to_string(),
+            fecha_hora_huso_gen_registro: "2024-01-03T19:20:30+01:00".try_into().unwrap(),
             ..anulacion_record()
         };
         assert_eq!(
@@ -3530,6 +3865,342 @@ mod edge_case_tests {
         }
         .huella();
         assert_eq!(chained, expected);
+    }
+
+    // ---- types as strict as SuministroInformacion.xsd -------------------
+
+    #[test]
+    fn si_no_has_no_x() {
+        assert_eq!(SiNo::try_from("S"), Ok(SiNo::S));
+        assert_eq!(SiNo::try_from("N"), Ok(SiNo::N));
+        assert!(SiNo::try_from("X").is_err());
+        assert!(SiNo::try_from("").is_err());
+    }
+
+    #[test]
+    fn alta_rechazo_previo_has_three_values() {
+        for (value, expected) in [
+            ("N", RechazoPrevio::N),
+            ("S", RechazoPrevio::S),
+            ("X", RechazoPrevio::X),
+        ] {
+            assert_eq!(RechazoPrevio::try_from(value), Ok(expected));
+            let registro = RegistroFacturacionAlta {
+                subsanacion: Some(SiNo::S),
+                rechazo_previo: Some(expected),
+                ..alta_record()
+            };
+            let xml = quick_xml::se::to_string_with_root("RegistroAlta", &registro)
+                .expect("an alta serializes");
+            assert!(xml.contains(&format!("<sum1:RechazoPrevio>{value}</sum1:RechazoPrevio>")));
+            let parsed: RegistroFacturacionAlta =
+                quick_xml::de::from_str(&xml).expect("the alta reads back");
+            assert_eq!(parsed.rechazo_previo, Some(expected));
+        }
+        assert!(RechazoPrevio::try_from("Z").is_err());
+    }
+
+    // RechazoPrevioAnulacionType is S/N: an anulación cannot carry `X`.
+    #[test]
+    fn anulacion_rechazo_previo_x_is_refused() {
+        let registro = RegistroFacturacionAnulacion {
+            rechazo_previo: Some(SiNo::S),
+            ..anulacion_record()
+        };
+        let xml = quick_xml::se::to_string_with_root("RegistroAnulacion", &registro)
+            .expect("an anulación serializes");
+        assert!(quick_xml::de::from_str::<RegistroFacturacionAnulacion>(&xml).is_ok());
+
+        let with_x = xml.replace(
+            "<sum1:RechazoPrevio>S</sum1:RechazoPrevio>",
+            "<sum1:RechazoPrevio>X</sum1:RechazoPrevio>",
+        );
+        assert_ne!(with_x, xml, "the record carries RechazoPrevio");
+        assert!(quick_xml::de::from_str::<RegistroFacturacionAnulacion>(&with_x).is_err());
+    }
+
+    #[test]
+    fn nif_is_exactly_nine_characters() {
+        assert!(NIF::try_from("B12345678").is_ok());
+        assert!(NIF::try_from("89890001K").is_ok());
+        for invalid in ["", "X", "AAAA", "B1234567", "ES12345678", "B123456789"] {
+            assert!(NIF::try_from(invalid).is_err(), "{invalid:?}");
+            assert!(NIF::try_from(invalid.to_owned()).is_err(), "{invalid:?}");
+        }
+    }
+
+    // The AEAT's own examples carry placeholders such as "AAAA": reading
+    // stays lenient.
+    #[test]
+    fn nif_of_any_length_still_deserializes() {
+        let xml = "<IDFactura><IDEmisorFactura>AAAA</IDEmisorFactura><NumSerieFactura>A-1</NumSerieFactura><FechaExpedicionFactura>15-03-2025</FechaExpedicionFactura></IDFactura>";
+        let id: IDFactura = quick_xml::de::from_str(xml).expect("a short NIF is readable");
+        assert_eq!(id.id_emisor_factura.as_str(), "AAAA");
+    }
+
+    #[test]
+    fn num_serie_factura_cannot_be_empty_or_too_long() {
+        assert!(TextoIDFactura::try_from("").is_err());
+        assert!(TextoIDFactura::try_from("A").is_ok());
+        assert!(TextoIDFactura::try_from("A".repeat(60)).is_ok());
+        assert!(TextoIDFactura::try_from("A".repeat(61)).is_err());
+    }
+
+    // Validaciones 3.1.3.1, error 1104: ASCII 32 to 126 without " ' < > =.
+    #[test]
+    fn num_serie_factura_is_held_to_the_aeat_character_set() {
+        for code in 0u32..=0x180 {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let value = format!("A{c}1");
+            let allowed = (32..=126).contains(&code) && !"\"'<>=".contains(c);
+            assert_eq!(
+                TextoIDFactura::try_from(value.as_str()).is_ok(),
+                allowed,
+                "character {code} in {value:?}"
+            );
+        }
+        for valid in ["12345678/G33", "2025-1", "FRA 2025/0001", "A_1.2(3)#4"] {
+            assert!(TextoIDFactura::try_from(valid).is_ok(), "{valid:?}");
+        }
+        for invalid in ["Fra. Nº 1", "F=2025-1", "FRA-ñ", "A\"1\"", "A'1", "<1>"] {
+            assert!(TextoIDFactura::try_from(invalid).is_err(), "{invalid:?}");
+        }
+        // A huella field: a space is allowed inside, never at either end.
+        assert!(TextoIDFactura::try_from(" A1").is_err());
+        assert!(TextoIDFactura::try_from("A1 ").is_err());
+    }
+
+    // What another system registered stays readable, whatever its characters.
+    #[test]
+    fn num_serie_factura_outside_the_character_set_still_deserializes() {
+        let xml = "<IDFactura><IDEmisorFactura>B12345678</IDEmisorFactura><NumSerieFactura>Fra. Nº 1</NumSerieFactura><FechaExpedicionFactura>15-03-2025</FechaExpedicionFactura></IDFactura>";
+        let id: IDFactura = quick_xml::de::from_str(xml).expect("the reference is readable");
+        assert_eq!(id.num_serie_factura.as_str(), "Fra. Nº 1");
+    }
+
+    // ImporteTotal is ImporteSgn12.2Type: twelve integer digits, not fourteen.
+    #[test]
+    fn importe_total_has_twelve_integer_digits() {
+        let twelve: ImporteSgn12_2 = "-123456789012.34".try_into().expect("twelve digits fit");
+        let registro = RegistroFacturacionAlta {
+            importe_total: twelve,
+            ..alta_record()
+        };
+        assert_eq!(registro.importe_total.as_str(), "-123456789012.34");
+        assert!(ImporteSgn12_2::try_from("1234567890123.00").is_err());
+
+        let xml = quick_xml::se::to_string_with_root("RegistroAlta", &alta_record())
+            .expect("an alta serializes");
+        let too_long = xml.replace(
+            "<sum1:ImporteTotal>121.00</sum1:ImporteTotal>",
+            "<sum1:ImporteTotal>1234567890123.00</sum1:ImporteTotal>",
+        );
+        assert_ne!(too_long, xml, "the record carries ImporteTotal");
+        assert!(quick_xml::de::from_str::<RegistroFacturacionAlta>(&too_long).is_err());
+    }
+
+    #[test]
+    fn clave_regimen_is_the_xsd_enumeration() {
+        let enumeration = [
+            "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "14", "15", "17",
+            "18", "19", "20", "21",
+        ];
+        for code in enumeration {
+            let clave = IdOperacionesTrascendenciaTributaria::try_from(code)
+                .expect("a code of the enumeration");
+            assert_eq!(clave.as_str(), code);
+            assert_eq!(clave.to_string(), code);
+        }
+        for invalid in ["", "1", "00", "12", "13", "16", "22", "99", "ZZZZ", " 01"] {
+            assert!(
+                IdOperacionesTrascendenciaTributaria::try_from(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clave_regimen_serializes_its_code() {
+        let detalle = Detalle {
+            clave_regimen: Some(IdOperacionesTrascendenciaTributaria::C08),
+            ..Default::default()
+        };
+        let xml = quick_xml::se::to_string_with_root("DetalleDesglose", &detalle)
+            .expect("a detalle serializes");
+        assert!(xml.contains("<sum1:ClaveRegimen>08</sum1:ClaveRegimen>"));
+        let parsed: Detalle = quick_xml::de::from_str(&xml).expect("the detalle reads back");
+        assert_eq!(
+            parsed.clave_regimen,
+            Some(IdOperacionesTrascendenciaTributaria::C08)
+        );
+        let unknown = xml.replace(">08<", ">99<");
+        assert!(quick_xml::de::from_str::<Detalle>(&unknown).is_err());
+    }
+
+    #[test]
+    fn id_version_is_the_xsd_enumeration() {
+        assert_eq!(IDVersion::try_from("1.0"), Ok(IDVersion::V1_0));
+        for invalid in ["", "1", "1.1", "2.0", "1.0 "] {
+            assert!(IDVersion::try_from(invalid).is_err(), "{invalid:?}");
+        }
+
+        let xml = quick_xml::se::to_string_with_root("RegistroAlta", &alta_record())
+            .expect("an alta serializes");
+        assert!(xml.contains("<sum1:IDVersion>1.0</sum1:IDVersion>"));
+        let other = xml.replace(
+            "<sum1:IDVersion>1.0</sum1:IDVersion>",
+            "<sum1:IDVersion>2.0</sum1:IDVersion>",
+        );
+        assert!(quick_xml::de::from_str::<RegistroFacturacionAlta>(&other).is_err());
+    }
+
+    #[test]
+    fn fecha_hora_huso_requires_seconds_and_a_time_zone() {
+        for valid in [
+            "2024-01-01T19:20:30+01:00",
+            "2024-01-01T19:20:30-05:30",
+            "2024-01-01T19:20:30+00:00",
+            "2024-01-01T19:20:30Z",
+            "2024-02-29T23:59:59+14:00",
+        ] {
+            let fecha = FechaHoraHuso::try_from(valid).expect("a valid timestamp");
+            assert_eq!(fecha.as_str(), valid);
+        }
+        for invalid in [
+            "",
+            "garbage",
+            "2024-01-01",
+            "2024-01-01T19:20:30",
+            "2024-01-01 19:20:30+01:00",
+            "2024-01-01T19:20+01:00",
+            "2024-01-01T19:20:30.123+01:00",
+            "2024-01-01T19:20:30+0100",
+            "2024-01-01T19:20:30+01",
+            "2024-01-01T19:20:30+15:00",
+            "2024-13-01T19:20:30+01:00",
+            "2023-02-29T19:20:30+01:00",
+            "2024-01-01T24:20:30+01:00",
+            "2024-01-01T19:60:30+01:00",
+            "2024-01-01T19:20:60+01:00",
+            "24-01-01T19:20:30+01:00",
+            "02024-01-01T19:20:30+01:00",
+            "-2024-01-01T19:20:30+01:00",
+            " 2024-01-01T19:20:30+01:00",
+            "2024-01-01T19:20:30+01:00 ",
+            "01-01-2024T19:20:30+01:00",
+        ] {
+            assert!(FechaHoraHuso::try_from(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn fecha_hora_huso_is_formatted_once_from_a_date_time() {
+        use chrono::TimeZone;
+
+        let madrid = chrono::FixedOffset::east_opt(3600).expect("a valid offset");
+        let date_time = madrid
+            .with_ymd_and_hms(2024, 1, 1, 19, 20, 30)
+            .single()
+            .expect("an unambiguous instant");
+        let fecha = FechaHoraHuso::from_datetime(&date_time).expect("a valid timestamp");
+        assert_eq!(fecha.as_str(), "2024-01-01T19:20:30+01:00");
+
+        // Sub-second precision is dropped, and UTC is written as an offset.
+        let utc = chrono::Utc
+            .with_ymd_and_hms(2025, 3, 15, 9, 0, 0)
+            .single()
+            .expect("an unambiguous instant")
+            + chrono::Duration::milliseconds(750);
+        let fecha = FechaHoraHuso::from_datetime(&utc).expect("a valid timestamp");
+        assert_eq!(fecha.as_str(), "2025-03-15T09:00:00+00:00");
+    }
+
+    // The response side is xs:dateTime, which allows fractional seconds and a
+    // missing time zone. The value is kept exactly as received.
+    #[test]
+    fn fecha_hora_huso_reads_any_xs_date_time() {
+        for received in [
+            "2024-11-27T11:54:10+01:00",
+            "2024-11-27T11:54:10.123+01:00",
+            "2024-11-27T11:54:10",
+            "2024-11-27T10:54:10Z",
+            "2024-11-27T24:00:00",
+        ] {
+            let xml =
+                format!("<R><FechaHoraHusoGenRegistro>{received}</FechaHoraHusoGenRegistro></R>");
+            let datos: RespuestaDatosRegistroFacturacion =
+                quick_xml::de::from_str(&xml).expect("an xs:dateTime is readable");
+            assert_eq!(
+                datos.fecha_hora_huso_gen_registro.as_deref(),
+                Some(received)
+            );
+        }
+        let xml = "<R><FechaHoraHusoGenRegistro>garbage</FechaHoraHusoGenRegistro></R>";
+        assert!(quick_xml::de::from_str::<RespuestaDatosRegistroFacturacion>(xml).is_err());
+    }
+
+    // The typed timestamp is sent and hashed as the exact string it was built
+    // from: the first record of the AEAT huella documentation, through the
+    // full struct.
+    #[test]
+    fn typed_timestamp_keeps_the_huella_byte_identical() {
+        use chrono::TimeZone;
+
+        let madrid = chrono::FixedOffset::east_opt(3600).expect("a valid offset");
+        let date_time = madrid
+            .with_ymd_and_hms(2024, 1, 1, 19, 20, 30)
+            .single()
+            .expect("an unambiguous instant");
+        let registro = RegistroFacturacionAlta {
+            id_factura: IDFactura {
+                id_emisor_factura: "89890001K".try_into().expect("a valid NIF"),
+                num_serie_factura: "12345678/G33".try_into().expect("a valid reference"),
+                fecha_expedicion_factura: "01-01-2024".try_into().expect("a valid date"),
+            },
+            cuota_total: "12.35".try_into().expect("a valid amount"),
+            importe_total: "123.45".try_into().expect("a valid amount"),
+            fecha_hora_huso_gen_registro: FechaHoraHuso::from_datetime(&date_time)
+                .expect("a valid timestamp"),
+            ..alta_record()
+        };
+        assert_eq!(
+            registro.hash(None),
+            "3C464DAF61ACB827C65FDA19F352A4E3BDC2C640E9E9FC4CC058073F38F12F60"
+        );
+        let xml = quick_xml::se::to_string_with_root("RegistroAlta", &registro)
+            .expect("an alta serializes");
+        assert!(xml.contains(
+            "<sum1:FechaHoraHusoGenRegistro>2024-01-01T19:20:30+01:00</sum1:FechaHoraHusoGenRegistro>"
+        ));
+    }
+
+    // PersonaFisicaJuridicaESType: NombreRazon and NIF, nothing else.
+    #[test]
+    fn cabecera_personas_are_nif_only() {
+        let cabecera = Cabecera {
+            representante: Some(PersonaFisicaJuridicaES {
+                nombre_razon: "Asesor SL".try_into().expect("a valid name"),
+                nif: "B87654321".try_into().expect("a valid NIF"),
+            }),
+            ..cabecera()
+        };
+        let xml = quick_xml::se::to_string_with_root("Cabecera", &cabecera)
+            .expect("a cabecera serializes");
+        assert!(xml.contains(
+            "<sum1:ObligadoEmision><sum1:NombreRazon>Emisor SL</sum1:NombreRazon><sum1:NIF>B12345678</sum1:NIF></sum1:ObligadoEmision>"
+        ));
+        assert!(xml.contains(
+            "<sum1:Representante><sum1:NombreRazon>Asesor SL</sum1:NombreRazon><sum1:NIF>B87654321</sum1:NIF></sum1:Representante>"
+        ));
+        let parsed: Cabecera = quick_xml::de::from_str(&xml).expect("the cabecera reads back");
+        assert_eq!(parsed.obligado_emision.nif.as_str(), "B12345678");
+
+        let id_otro = "<sum1:IDOtro><sum1:CodigoPais>FR</sum1:CodigoPais><sum1:IDType>02</sum1:IDType><sum1:ID>FR12345678901</sum1:ID></sum1:IDOtro>";
+        let foreign = xml.replace("<sum1:NIF>B12345678</sum1:NIF>", id_otro);
+        assert_ne!(foreign, xml, "the cabecera carries the NIF");
+        assert!(quick_xml::de::from_str::<Cabecera>(&foreign).is_err());
     }
 
     // ---- negative ImporteSgn amounts ------------------------------------
