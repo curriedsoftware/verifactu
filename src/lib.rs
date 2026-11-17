@@ -91,6 +91,10 @@ macro_rules! request {
             .http()
             .post(endpoint)
             .header("Content-Type", "text/xml; charset=utf-8")
+            // SOAP 1.1 over HTTP requires the header, and the AEAT WSDL binding
+            // declares `soapAction=""` for every operation: the value is the
+            // empty quoted string, not an empty header.
+            .header("SOAPAction", "\"\"")
             .body(xml_body)
             .send()
             .await
