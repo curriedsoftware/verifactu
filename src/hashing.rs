@@ -123,7 +123,7 @@ impl Hashable for RegistroFacturacionAlta {
             cuota_total: self.cuota_total.as_ref(),
             importe_total: self.importe_total.as_ref(),
             prev_huella,
-            fecha_hora_huso_gen_registro: &self.fecha_hora_huso_gen_registro,
+            fecha_hora_huso_gen_registro: self.fecha_hora_huso_gen_registro.as_str(),
         }
         .huella()
     }
@@ -139,7 +139,7 @@ impl Hashable for RegistroFacturacionAnulacion {
                 .fecha_expedicion_factura_anulada
                 .as_ref(),
             prev_huella,
-            fecha_hora_huso_gen_registro: &self.fecha_hora_huso_gen_registro,
+            fecha_hora_huso_gen_registro: self.fecha_hora_huso_gen_registro.as_str(),
         }
         .huella()
     }

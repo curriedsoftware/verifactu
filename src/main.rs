@@ -557,7 +557,7 @@ fn print_consulta_table(result: &RespuestaConsultaLR) {
             match datos.subsanacion {
                 Some(SiNo::S) => "Sí",
                 Some(SiNo::N) => "No",
-                Some(SiNo::X) | None => "-",
+                None => "-",
             },
             datos
                 .tipo_factura

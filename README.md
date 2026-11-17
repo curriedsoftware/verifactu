@@ -24,6 +24,29 @@ Add this to your `Cargo.toml`:
 verifactu = "0.1"
 ```
 
+## Strict when building, lenient when reading
+
+The schema types hold a request to `SuministroInformacion.xsd`, so a value the
+AEAT would refuse cannot be built in the first place:
+
+- `NIF` is exactly 9 characters.
+- `TextoIDFactura` (`NumSerieFactura`) is 1 to 60 printable ASCII characters,
+  without `"`, `'`, `<`, `>` or `=` (AEAT error 1104).
+- `SiNo` is `S` or `N`. Only the alta's `RechazoPrevio` has the third value `X`.
+- `IdOperacionesTrascendenciaTributaria` (`ClaveRegimen`) and `IDVersion` are
+  the XSD enumerations.
+- `ImporteTotal` is an `ImporteSgn12_2`: at most 12 integer digits.
+- `FechaHoraHuso` (`FechaHoraHusoGenRegistro`) is built from a
+  `chrono::DateTime` or from a `YYYY-MM-DDThh:mm:ssTZD` string, and is sent and
+  hashed as that exact string.
+- `PersonaFisicaJuridicaES`, the `ObligadoEmision` and `Representante` of a
+  `Cabecera`, is identified by NIF only. `PersonaFisicaJuridica` also accepts a
+  foreign identifier.
+
+Reading is deliberately laxer where the AEAT returns more than a request may
+carry: a NIF of any length, a `NumSerieFactura` with any characters and any
+`xs:dateTime` are kept exactly as received.
+
 ## Choosing the environment
 
 The target AEAT environment is a runtime choice, not a build flag. It defaults

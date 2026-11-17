@@ -25,7 +25,7 @@
 use quick_xml::de::from_str;
 use serde::Deserialize;
 use verifactu::schema::{
-    ConsultaFactuSistemaFacturacion, RegistroFactura, RegistroFacturacionAlta, SiNo,
+    ConsultaFactuSistemaFacturacion, RechazoPrevio, RegistroFactura, RegistroFacturacionAlta, SiNo,
     SoapEnvelopeConsulta, SoapEnvelopeReg, SuministroInformacion, TipoFactura,
 };
 
@@ -116,7 +116,7 @@ fn parses_voluntary_subsanacion_example() {
 fn parses_voluntary_alta_post_rechazo_example() {
     let suministro = parse_suministro(VOLUNTARIA_ALTA_POST_RECHAZO);
     let alta = expect_single_alta(&suministro);
-    assert!(matches!(alta.rechazo_previo, Some(SiNo::X)));
+    assert!(matches!(alta.rechazo_previo, Some(RechazoPrevio::X)));
 }
 
 #[test]
