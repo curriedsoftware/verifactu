@@ -2002,14 +2002,76 @@ impl<'de> Deserialize<'de> for Destinatario {
     }
 }
 
+/// A party identified by something other than a Spanish NIF.
+///
+/// `CodigoPais` is optional in the AEAT XSD (`IDOtroType`, `minOccurs = 0`)
+/// and is left out of the XML when `codigo_pais` is `None`. The AEAT business
+/// rules only waive it for `IDType = 02` (NIF-IVA), where the identifier
+/// already carries the member state prefix; every other `IDType` must carry
+/// it (error 1111). That rule is checked by [`IDOtro::validate`], which the
+/// record-level `validate()` methods call for each party they hold.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IDOtro {
-    #[serde(rename = "sum1:CodigoPais", alias = "CodigoPais")]
-    pub codigo_pais: CountryType,
+    #[serde(
+        rename = "sum1:CodigoPais",
+        alias = "CodigoPais",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codigo_pais: Option<CountryType>,
     #[serde(rename = "sum1:IDType", alias = "IDType")]
     pub id_type: PersonaFisicaJuridicaID,
     #[serde(rename = "sum1:ID", alias = "ID")]
     pub id: StringMax20,
+}
+
+impl IDOtro {
+    /// An identifier that states its country: the form every `IDType` other
+    /// than NIF-IVA (02) requires.
+    pub fn new(
+        codigo_pais: CountryType,
+        id_type: PersonaFisicaJuridicaID,
+        id: StringMax20,
+    ) -> Self {
+        Self {
+            codigo_pais: Some(codigo_pais),
+            id_type,
+            id,
+        }
+    }
+
+    /// A NIF-IVA (`IDType = 02`) identifier without `CodigoPais`. `id` is the
+    /// full VAT number including its member state prefix (for example
+    /// `EL123456789` for Greece, whose prefix differs from its ISO code `GR`).
+    pub fn nif_iva(id: StringMax20) -> Self {
+        Self {
+            codigo_pais: None,
+            id_type: PersonaFisicaJuridicaID::NifIva,
+            id,
+        }
+    }
+
+    /// Checks the AEAT rule behind error 1111: `CodigoPais` is mandatory
+    /// unless `IDType` is NIF-IVA (02).
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.codigo_pais.is_none() && !matches!(self.id_type, PersonaFisicaJuridicaID::NifIva) {
+            return Err(ValidationError::new(
+                "IDOtro",
+                "CodigoPais is required when IDType is not NIF-IVA (02)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Identificador {
+    /// Validates the `IDOtro` block, if this party is identified by one.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Identificador::Nif(_) => Ok(()),
+            Identificador::IdOtro(id_otro) => id_otro.validate(),
+        }
+    }
 }
 
 // Import rectification details
@@ -2339,6 +2401,17 @@ impl RegistroFacturacionAlta {
             }
         }
 
+        // CodigoPais is optional in the XSD but mandatory for every IDOtro
+        // whose IDType is not NIF-IVA (AEAT error 1111).
+        if let Some(ref tercero) = self.tercero {
+            tercero.identificador.validate()?;
+        }
+        if let Some(ref destinatarios) = self.destinatarios {
+            for destinatario in &destinatarios.destinatarios {
+                destinatario.identificador.validate()?;
+            }
+        }
+
         // Cross-field constraints between TipoFactura, TipoRectificativa and the
         // corrective/replacement reference blocks (AEAT XSD + business rules).
         let is_corrective = self.tipo_factura.is_corrective();
@@ -2492,6 +2565,11 @@ impl RegistroFacturacionAnulacion {
                 "RegistroFacturacionAnulacion",
                 format!("IDVersion must be '1.0', got '{}'", self.id_version),
             ));
+        }
+        // CodigoPais is optional in the XSD but mandatory for every IDOtro
+        // whose IDType is not NIF-IVA (AEAT error 1111).
+        if let Some(ref generador) = self.generador {
+            generador.identificador.validate()?;
         }
         Ok(())
     }
@@ -3424,6 +3502,181 @@ mod edge_case_tests {
             assert!(xml.contains(&expected), "{xml}");
             quick_xml::de::from_str::<IDOtro>(&xml).expect("deserialize");
         }
+    }
+
+    // ---- IDOtro without CodigoPais --------------------------------------
+
+    fn greek_nif_iva() -> IDOtro {
+        IDOtro::nif_iva("EL123456789".try_into().expect("valid id"))
+    }
+
+    fn pasaporte_without_country() -> IDOtro {
+        IDOtro {
+            codigo_pais: None,
+            id_type: PersonaFisicaJuridicaID::Pasaporte,
+            id: "X1234567".try_into().expect("valid id"),
+        }
+    }
+
+    fn destinatario(id_otro: IDOtro) -> Destinatario {
+        Destinatario {
+            nombre_razon: "Cliente".try_into().expect("valid name"),
+            identificador: Identificador::IdOtro(id_otro),
+        }
+    }
+
+    #[test]
+    fn id_otro_without_codigo_pais_omits_the_element() {
+        let xml = quick_xml::se::to_string(&greek_nif_iva()).expect("serialize");
+        assert_eq!(
+            xml,
+            "<IDOtro><sum1:IDType>02</sum1:IDType><sum1:ID>EL123456789</sum1:ID></IDOtro>"
+        );
+    }
+
+    #[test]
+    fn id_otro_with_codigo_pais_serializes_it_first() {
+        let id_otro = IDOtro::new(
+            CountryType::GR,
+            PersonaFisicaJuridicaID::NifIva,
+            "EL123456789".try_into().expect("valid id"),
+        );
+        let xml = quick_xml::se::to_string(&id_otro).expect("serialize");
+        assert_eq!(
+            xml,
+            "<IDOtro><sum1:CodigoPais>GR</sum1:CodigoPais><sum1:IDType>02</sum1:IDType>\
+             <sum1:ID>EL123456789</sum1:ID></IDOtro>"
+        );
+    }
+
+    #[test]
+    fn id_otro_without_codigo_pais_deserializes() {
+        // Unprefixed, as in a response, and prefixed, as in our own requests.
+        for xml in [
+            "<IDOtro><IDType>02</IDType><ID>EL123456789</ID></IDOtro>",
+            "<IDOtro><sum1:IDType>02</sum1:IDType><sum1:ID>EL123456789</sum1:ID></IDOtro>",
+        ] {
+            let id_otro = quick_xml::de::from_str::<IDOtro>(xml).expect("deserialize");
+            assert!(id_otro.codigo_pais.is_none(), "{xml}");
+            assert!(matches!(id_otro.id_type, PersonaFisicaJuridicaID::NifIva));
+            assert_eq!(id_otro.id.as_str(), "EL123456789");
+        }
+    }
+
+    #[test]
+    fn destinatario_without_codigo_pais_round_trips_in_an_alta() {
+        let alta = RegistroFacturacionAlta {
+            destinatarios: Some(
+                Destinatarios::new(vec![destinatario(greek_nif_iva())]).expect("one destinatario"),
+            ),
+            ..alta_record()
+        };
+        alta.validate().expect("NIF-IVA needs no CodigoPais");
+        let xml = quick_xml::se::to_string(&alta).expect("serialize");
+        assert!(
+            xml.contains(
+                "<sum1:IDOtro><sum1:IDType>02</sum1:IDType><sum1:ID>EL123456789</sum1:ID>\
+                 </sum1:IDOtro>"
+            ),
+            "{xml}"
+        );
+        assert!(!xml.contains("CodigoPais"), "{xml}");
+
+        let parsed: RegistroFacturacionAlta = quick_xml::de::from_str(&xml).expect("deserialize");
+        let destinatarios = parsed.destinatarios.expect("destinatarios kept");
+        match &destinatarios.destinatarios[0].identificador {
+            Identificador::IdOtro(id_otro) => assert!(id_otro.codigo_pais.is_none()),
+            Identificador::Nif(_) => panic!("expected an IDOtro"),
+        }
+    }
+
+    #[test]
+    fn consulta_party_without_codigo_pais_round_trips() {
+        let contraparte = PersonaFisicaJuridicaConsulta {
+            nombre_razon: "Cliente".try_into().expect("valid name"),
+            identificador: Identificador::IdOtro(greek_nif_iva()),
+        };
+        let xml = quick_xml::se::to_string(&contraparte).expect("serialize");
+        assert!(!xml.contains("CodigoPais"), "{xml}");
+        let parsed: PersonaFisicaJuridicaConsulta =
+            quick_xml::de::from_str(&xml).expect("deserialize");
+        match parsed.identificador {
+            Identificador::IdOtro(id_otro) => assert!(id_otro.codigo_pais.is_none()),
+            Identificador::Nif(_) => panic!("expected an IDOtro"),
+        }
+    }
+
+    #[test]
+    fn codigo_pais_is_required_unless_nif_iva() {
+        greek_nif_iva()
+            .validate()
+            .expect("NIF-IVA needs no CodigoPais");
+        for id_type in [
+            PersonaFisicaJuridicaID::Pasaporte,
+            PersonaFisicaJuridicaID::IDEnPaisResidencia,
+            PersonaFisicaJuridicaID::CertificadoResidencia,
+            PersonaFisicaJuridicaID::OtroDocumentoProbatorio,
+            PersonaFisicaJuridicaID::NoCensado,
+        ] {
+            let id: StringMax20 = "X1234567".try_into().expect("valid id");
+            let without = IDOtro {
+                codigo_pais: None,
+                id_type: id_type.clone(),
+                id: id.clone(),
+            };
+            assert!(without.validate().is_err(), "{id_type:?}");
+            IDOtro::new(CountryType::ES, id_type, id)
+                .validate()
+                .expect("CodigoPais present");
+        }
+    }
+
+    #[test]
+    fn alta_rejects_a_destinatario_missing_a_required_codigo_pais() {
+        let alta = RegistroFacturacionAlta {
+            destinatarios: Some(
+                Destinatarios::new(vec![
+                    destinatario(greek_nif_iva()),
+                    destinatario(pasaporte_without_country()),
+                ])
+                .expect("two destinatarios"),
+            ),
+            ..alta_record()
+        };
+        let error = alta.validate().expect_err("passport without CodigoPais");
+        assert!(error.to_string().contains("CodigoPais"), "{error}");
+    }
+
+    #[test]
+    fn alta_rejects_a_tercero_missing_a_required_codigo_pais() {
+        let alta = RegistroFacturacionAlta {
+            tercero: Some(PersonaFisicaJuridicaES {
+                nombre_razon: "Tercero".try_into().expect("valid name"),
+                identificador: Identificador::IdOtro(pasaporte_without_country()),
+            }),
+            ..alta_record()
+        };
+        assert!(alta.validate().is_err());
+    }
+
+    #[test]
+    fn anulacion_rejects_a_generador_missing_a_required_codigo_pais() {
+        let generador = |id_otro| {
+            Some(PersonaFisicaJuridicaES {
+                nombre_razon: "Generador".try_into().expect("valid name"),
+                identificador: Identificador::IdOtro(id_otro),
+            })
+        };
+        let rejected = RegistroFacturacionAnulacion {
+            generador: generador(pasaporte_without_country()),
+            ..anulacion_record()
+        };
+        assert!(rejected.validate().is_err());
+        let accepted = RegistroFacturacionAnulacion {
+            generador: generador(greek_nif_iva()),
+            ..anulacion_record()
+        };
+        accepted.validate().expect("NIF-IVA needs no CodigoPais");
     }
 
     // ---- mixed Alta/Anulacion batch -------------------------------------
